@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    dnsutils \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
+COPY . .
+
+# Create logs directory
+RUN mkdir -p /var/log
+
+# Expose ports
+EXPOSE 443 1080 5000
+
+# Run bridge
+CMD ["python", "-u", "storm_3xui_bridge.py"]

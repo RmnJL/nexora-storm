@@ -1,0 +1,200 @@
+version: '3.8'
+
+services:
+  # Inside Gateway - stable STORM client entrypoint
+  storm-inside:
+    build:
+      context: .
+      dockerfile: Dockerfile.inside
+    container_name: storm-inside-gateway
+    environment:
+      ROLE: inside_gateway
+      RESOLVERS: "8.8.8.8,1.1.1.1,9.9.9.9"
+      DNS_ZONE: "t1.phonexpress.ir"
+      LISTEN_PORT: "1443"
+      LISTEN_HOST: "0.0.0.0"
+      LOG_LEVEL: "INFO"
+    command:
+      - sh
+      - -c
+      - >
+        python -u storm_client.py
+        --listen $${LISTEN_HOST}:$${LISTEN_PORT}
+        --resolvers $$(echo "$${RESOLVERS}" | tr ',' ' ')
+        --zone $${DNS_ZONE}
+    ports:
+      - "1443:1443"    # STORM local TCP listener
+    volumes:
+      - ./:/app
+      - /var/log:/var/log
+    networks:
+      - storm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 1443), 1); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Outside Gateway - canonical STORM server entrypoint
+  storm-outside:
+    build:
+      context: .
+      dockerfile: Dockerfile.outside
+    container_name: storm-outside-gateway
+    environment:
+      ROLE: outside_gateway
+      DNS_ZONE: "t1.phonexpress.ir"
+      DNS_PORT: "53"
+      UPSTREAM_HOST: "127.0.0.1"
+      UPSTREAM_PORT: "10000"
+      UPSTREAM_PROTOCOL: "socks5"
+      LOG_LEVEL: "INFO"
+    command:
+      - sh
+      - -c
+      - >
+        python -u storm_server.py
+        --listen 0.0.0.0:$${DNS_PORT}
+        --target $${UPSTREAM_HOST}:$${UPSTREAM_PORT}
+        --zone $${DNS_ZONE}
+    ports:
+      - "53:53/udp"    # DNS listener
+    volumes:
+      - ./:/app
+      - /var/log:/var/log
+    networks:
+      - storm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "dig", "@127.0.0.1", "-p", "53", "health.t1.phonexpress.ir", "TXT", "+time=1", "+tries=1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - 3xui
+
+  # 3x-UI Management Panel
+  3xui:
+    image: ghcr.io/mhsanaei/3x-ui:latest
+    container_name: 3xui-panel
+    environment:
+      XRAY_MANAGEMENT_API_LISTEN: "0.0.0.0:10085"
+      XRAY_TRAFFIC_STATS_LISTEN: "0.0.0.0:10086"
+      LOG_LEVEL: "info"
+    ports:
+      - "54321:54321"  # Web UI
+      - "10000:10000"  # XRay API (SOCKS inbound)
+      - "10085:10085"  # Management API
+      - "10086:10086"  # Stats API
+    volumes:
+      - 3xui-data:/etc/x-ui
+      - ./3xui-config.json:/etc/x-ui/x-ui.json:ro
+    networks:
+      - storm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:54321"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache (for rate limiting + session store)
+  redis:
+    image: redis:7-alpine
+    container_name: storm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - storm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL User Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: storm-db
+    environment:
+      POSTGRES_USER: storm
+      POSTGRES_PASSWORD: changeme123
+      POSTGRES_DB: storm_users
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    networks:
+      - storm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storm"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Monitoring + Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: storm-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - storm-network
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: storm-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    networks:
+      - storm-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Log Aggregation (optional)
+  loki:
+    image: grafana/loki:latest
+    container_name: storm-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - storm-network
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+
+networks:
+  storm-network:
+    driver: bridge
+
+volumes:
+  3xui-data:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
