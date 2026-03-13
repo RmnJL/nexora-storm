@@ -10,9 +10,10 @@ import asyncio
 import argparse
 import logging
 import socket
+import time
 from typing import Optional
 
-from storm_connection import ConnectionConfig, ConnectionManager, STORMConnection
+from storm_connection import ConnectionConfig, ConnectionManager, ConnectionState, STORMConnection
 from storm_dns_server import STORMDNSServer
 from storm_proto import PacketFlags, make_packet, parse_packet
 
@@ -65,10 +66,12 @@ class STORMServer:
         target_host: str = "127.0.0.1",
         target_port: int = 443,
         tunnel_zone: str = "t1.phonexpress.ir",
+        connection_idle_timeout: float = 30.0,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.tunnel_zone = tunnel_zone
+        self.connection_idle_timeout = max(5.0, float(connection_idle_timeout))
         
         # Connection management
         self.conn_config = ConnectionConfig()
@@ -157,10 +160,14 @@ class STORMServer:
             reader, writer = target_conn
             
             # Forward data between STORM and target TCP
-            await asyncio.gather(
-                self._forward_storm_to_target(storm_conn, writer),
-                self._forward_target_to_storm(reader, storm_conn),
-            )
+            tasks = [
+                asyncio.create_task(self._forward_storm_to_target(storm_conn, writer)),
+                asyncio.create_task(self._forward_target_to_storm(reader, storm_conn)),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
         
         except Exception as e:
             log.error(f"connection task error: {e}")
@@ -176,15 +183,33 @@ class STORMServer:
     ) -> None:
         """Forward STORM data to target TCP"""
         try:
+            idle_rounds = 0
             while not target_writer.is_closing():
                 data = await storm_conn.get_ordered_data(timeout=0.5)
                 if data:
                     log.debug(f"forward {len(data)} bytes to target")
                     target_writer.write(data)
                     await target_writer.drain()
+                    idle_rounds = 0
+                    continue
+
+                # Close stale connections to avoid descriptor leaks under DNS loss.
+                idle_rounds += 1
+                idle_for = time.time() - storm_conn.last_activity_at
+                if storm_conn.state in {ConnectionState.CLOSING, ConnectionState.CLOSED, ConnectionState.ERROR}:
+                    break
+                if idle_for >= self.connection_idle_timeout and idle_rounds >= 3:
+                    break
         
         except Exception as e:
             log.error(f"forward to target error: {e}")
+        finally:
+            if not target_writer.is_closing():
+                target_writer.close()
+                try:
+                    await target_writer.wait_closed()
+                except Exception:
+                    pass
     
     async def _forward_target_to_storm(
         self,
@@ -193,8 +218,16 @@ class STORMServer:
     ) -> None:
         """Forward target TCP data to STORM"""
         try:
-            while not target_reader.at_eof():
-                data = await target_reader.read(4096)
+            while True:
+                try:
+                    data = await asyncio.wait_for(target_reader.read(4096), timeout=1.0)
+                except asyncio.TimeoutError:
+                    idle_for = time.time() - storm_conn.last_activity_at
+                    if storm_conn.state in {ConnectionState.CLOSING, ConnectionState.CLOSED, ConnectionState.ERROR}:
+                        break
+                    if idle_for >= self.connection_idle_timeout:
+                        break
+                    continue
                 if not data:
                     break
                 
@@ -237,6 +270,7 @@ async def main():
     parser.add_argument("--listen", default="0.0.0.0:53", help="Listen address host:port")
     parser.add_argument("--target", default="127.0.0.1:8443", help="Target address host:port")
     parser.add_argument("--zone", default="t1.phonexpress.ir", help="Tunnel DNS zone")
+    parser.add_argument("--connection-idle-timeout", type=float, default=30.0, help="Idle seconds before forced connection close")
     args = parser.parse_args()
     
     listen_host, listen_port = args.listen.rsplit(":", 1)
@@ -254,6 +288,7 @@ async def main():
         target_host=target_host,
         target_port=int(target_port),
         tunnel_zone=args.zone,
+        connection_idle_timeout=args.connection_idle_timeout,
     )
     
     try:

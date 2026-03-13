@@ -171,6 +171,9 @@ class STORMConnection:
             recovered = self.fec.add_packet(absolute_seq, frame_payload)
             if recovered:
                 print(f"[{self.conn_id_hex()}] FEC recovered packet {absolute_seq}")
+        elif frame_header.frame_type in (FrameType.CLOSE, FrameType.RESET):
+            self.state = ConnectionState.CLOSED
+            self._closed_event.set()
     
     async def _handle_parity_frame(self, payload: bytes) -> None:
         """Process parity frame"""

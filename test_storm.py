@@ -183,6 +183,27 @@ class TestConnection:
         packet = conn.get_next_outgoing()
         assert packet is not None
 
+    @pytest.mark.asyncio
+    async def test_close_frame_marks_connection_closed(self):
+        """CLOSE frame should transition connection state to CLOSED."""
+        conn = STORMConnection()
+        conn.state = ConnectionState.OPEN
+
+        close_frame = make_frame(
+            frame_type=FrameType.CLOSE,
+            frame_flags=0,
+            seq_group=0,
+            payload=b"",
+        )
+        packet = make_packet(
+            conn_id=conn.conn_id,
+            flags=PacketFlags.DATA | PacketFlags.FINAL,
+            seq_offset=0,
+            payload=close_frame,
+        )
+        await conn.handle_incoming_packet(packet)
+        assert conn.state == ConnectionState.CLOSED
+
 
 class TestIntegration:
     """Integration tests"""
