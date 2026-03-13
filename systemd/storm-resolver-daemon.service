@@ -1,0 +1,17 @@
+[Unit]
+Description=STORM Resolver Background Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nexora-storm
+ExecStart=/opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_resolver_daemon.py --resolvers-file /opt/nexora-storm/data/resolvers.txt --active-out /opt/nexora-storm/state/resolvers_active.txt --state-json /opt/nexora-storm/state/resolver_daemon_state.json --zone t1.phonexpress.ir --timeout 1.5 --max-probe 40 --concurrency 15 --take 4 --min-healthy 2 --allow-fallback --interval 60 --restart-on-change --restart-cooldown 600
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

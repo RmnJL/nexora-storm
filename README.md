@@ -148,6 +148,7 @@ Operational runbook:
 Active probe tool:
 - `storm_health_check.py`
 - `storm_resolver_picker.py` (selects healthy resolvers from `data/resolvers.txt`)
+- `storm_resolver_daemon.py` (keeps active resolver set fresh in background)
 
 ### Client (Inside Server)
 
@@ -192,13 +193,16 @@ python storm_server.py \
 Use provided systemd units:
 - `systemd/storm-server.service`
 - `systemd/storm-client.service`
+- `systemd/storm-resolver-daemon.service` (inside resolver manager)
 
 Install:
 ```bash
 sudo cp systemd/storm-server.service /etc/systemd/system/
+sudo cp systemd/storm-resolver-daemon.service /etc/systemd/system/
 sudo cp systemd/storm-client.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now storm-server
+sudo systemctl enable --now storm-resolver-daemon
 sudo systemctl enable --now storm-client
 ```
 

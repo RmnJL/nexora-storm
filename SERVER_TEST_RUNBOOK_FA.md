@@ -150,10 +150,13 @@ sudo systemctl status storm-server --no-pager
 ```bash
 cd /opt/nexora-storm
 chmod +x run_storm_client_auto.sh
+sudo cp systemd/storm-resolver-daemon.service /etc/systemd/system/
 sudo cp systemd/storm-client.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now storm-resolver-daemon
 sudo systemctl enable --now storm-client
 sudo systemctl status storm-client --no-pager
+sudo systemctl status storm-resolver-daemon --no-pager
 ```
 
 لاگ‌ها:
@@ -161,4 +164,12 @@ sudo systemctl status storm-client --no-pager
 ```bash
 sudo journalctl -u storm-server -f
 sudo journalctl -u storm-client -f
+sudo journalctl -u storm-resolver-daemon -f
+```
+
+فایل خروجی resolverهای فعال (روی inside):
+
+```bash
+cat /opt/nexora-storm/state/resolvers_active.txt
+cat /opt/nexora-storm/state/resolver_daemon_state.json
 ```

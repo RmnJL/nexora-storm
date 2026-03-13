@@ -1,7 +1,7 @@
 [Unit]
 Description=STORM Inside Client (Auto Resolver Selection)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target storm-resolver-daemon.service
+Wants=network-online.target storm-resolver-daemon.service
 
 [Service]
 Type=simple
@@ -14,4 +14,3 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-
