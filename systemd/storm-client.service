@@ -6,6 +6,10 @@ Wants=network-online.target storm-resolver-daemon.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/nexora-storm
+Environment=STORM_BOOTSTRAP_ALLOW_FALLBACK=0
+Environment=STORM_PICKER_SAMPLE_MODE=random
+Environment=STORM_RESOLVER_MAX_PROBE=300
+Environment=STORM_RESOLVER_CONCURRENCY=60
 ExecStart=/opt/nexora-storm/run_storm_client_auto.sh
 Restart=always
 RestartSec=2

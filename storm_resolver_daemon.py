@@ -14,6 +14,7 @@ from dataclasses import asdict
 import json
 import logging
 import os
+import random
 import shlex
 import subprocess
 import time
@@ -100,23 +101,85 @@ def should_restart(last_restart_at: float, now: float, cooldown: float) -> bool:
     return (now - last_restart_at) >= cooldown
 
 
+def _unique_ordered(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def select_probe_subset(
+    pool: list[str],
+    previous_active: list[str],
+    max_probe: int,
+    probe_mode: str,
+    sticky_keep: int,
+    cursor: int,
+) -> tuple[list[str], int]:
+    unique_pool = _unique_ordered(pool)
+    if not unique_pool:
+        return [], cursor
+
+    cap = min(max(1, max_probe), len(unique_pool))
+    sticky_cap = max(0, sticky_keep)
+    sticky = [r for r in previous_active if r in unique_pool][:sticky_cap]
+    sticky = _unique_ordered(sticky)
+
+    selected: list[str] = list(sticky)
+    if len(selected) >= cap:
+        return selected[:cap], cursor
+
+    remaining = [r for r in unique_pool if r not in set(selected)]
+    need = cap - len(selected)
+    if need <= 0 or not remaining:
+        return selected, cursor
+
+    if probe_mode == "random":
+        picks = random.sample(remaining, need) if need < len(remaining) else remaining
+        return selected + picks, cursor
+
+    if probe_mode == "sequential":
+        start = cursor % len(remaining)
+        rotated = remaining[start:] + remaining[:start]
+        picks = rotated[:need]
+        new_cursor = (start + len(picks)) % len(remaining)
+        return selected + picks, new_cursor
+
+    raise ValueError(f"unsupported probe_mode: {probe_mode}")
+
+
 class ResolverDaemon:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.last_restart_at = 0.0
+        self.probe_cursor = 0
 
     async def run_once(self) -> dict[str, Any]:
         pool = load_resolvers_file(self.args.resolvers_file)
         if not pool:
             raise RuntimeError("no valid resolvers in resolver file")
 
+        previous = load_active_resolvers(self.args.active_out)
+        probe_set, self.probe_cursor = select_probe_subset(
+            pool=pool,
+            previous_active=previous,
+            max_probe=self.args.max_probe,
+            probe_mode=self.args.probe_mode,
+            sticky_keep=self.args.sticky_keep,
+            cursor=self.probe_cursor,
+        )
+
         results = await probe_pool(
-            resolvers=pool,
+            resolvers=probe_set,
             zone=self.args.zone,
             qtype=self.args.qtype,
             timeout=self.args.timeout,
-            max_probe=self.args.max_probe,
+            max_probe=len(probe_set),
             concurrency=self.args.concurrency,
+            sample_mode="head",
         )
         selected, healthy_count, eligible = compute_selection(
             results=results,
@@ -125,7 +188,10 @@ class ResolverDaemon:
             allow_fallback=self.args.allow_fallback,
         )
 
-        previous = load_active_resolvers(self.args.active_out)
+        healthy_ranked = rank_resolvers([r for r in results if r.ok], self.args.healthy_out_max)
+        if healthy_ranked:
+            atomic_write_text(self.args.healthy_out, format_active_resolvers(healthy_ranked))
+
         changed = False
         restarted = False
         restart_reason = ""
@@ -154,11 +220,14 @@ class ResolverDaemon:
         state = {
             "timestamp": time.time(),
             "pool_size": len(pool),
+            "probed_count": len(probe_set),
+            "probe_mode": self.args.probe_mode,
             "healthy_count": healthy_count,
             "eligible": eligible,
             "previous": previous,
             "selected": selected,
             "active": load_active_resolvers(self.args.active_out),
+            "healthy_ranked": healthy_ranked,
             "changed": changed,
             "restarted": restarted,
             "restart_reason": restart_reason,
@@ -167,8 +236,9 @@ class ResolverDaemon:
         atomic_write_text(self.args.state_json, json.dumps(state, ensure_ascii=False, indent=2))
 
         log.info(
-            "cycle: pool=%d healthy=%d eligible=%s changed=%s restarted=%s active=%s",
+            "cycle: pool=%d probed=%d healthy=%d eligible=%s changed=%s restarted=%s active=%s",
             len(pool),
+            len(probe_set),
             healthy_count,
             eligible,
             changed,
@@ -220,11 +290,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zone", default="t1.phonexpress.ir")
     parser.add_argument("--qtype", default="TXT")
     parser.add_argument("--timeout", type=float, default=1.5)
-    parser.add_argument("--max-probe", type=int, default=40)
+    parser.add_argument("--max-probe", type=int, default=400)
     parser.add_argument("--concurrency", type=int, default=15)
+    parser.add_argument("--probe-mode", choices=["random", "sequential"], default="random")
+    parser.add_argument("--sticky-keep", type=int, default=4)
     parser.add_argument("--take", type=int, default=4)
     parser.add_argument("--min-healthy", type=int, default=2)
     parser.add_argument("--allow-fallback", action="store_true")
+    parser.add_argument("--healthy-out", default="state/resolvers_healthy.txt")
+    parser.add_argument("--healthy-out-max", type=int, default=256)
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--restart-on-change", action="store_true")
     parser.add_argument("--restart-cmd", default="systemctl restart storm-client")
@@ -257,4 +331,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

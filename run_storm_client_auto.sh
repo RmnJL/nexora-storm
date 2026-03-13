@@ -13,6 +13,8 @@ RESOLVER_TIMEOUT="${STORM_RESOLVER_TIMEOUT:-1.5}"
 RESOLVER_MAX_PROBE="${STORM_RESOLVER_MAX_PROBE:-40}"
 RESOLVER_CONCURRENCY="${STORM_RESOLVER_CONCURRENCY:-15}"
 ACTIVE_RESOLVERS_FILE="${STORM_ACTIVE_RESOLVERS_FILE:-${BASE_DIR}/state/resolvers_active.txt}"
+PICKER_SAMPLE_MODE="${STORM_PICKER_SAMPLE_MODE:-random}"
+BOOTSTRAP_ALLOW_FALLBACK="${STORM_BOOTSTRAP_ALLOW_FALLBACK:-0}"
 
 SELECTED=""
 if [[ -s "${ACTIVE_RESOLVERS_FILE}" ]]; then
@@ -20,17 +22,21 @@ if [[ -s "${ACTIVE_RESOLVERS_FILE}" ]]; then
 fi
 
 if [[ -z "${SELECTED}" ]]; then
-  SELECTED="$(
-    "${PYTHON_BIN}" "${BASE_DIR}/storm_resolver_picker.py" \
-      --resolvers-file "${RESOLVER_FILE}" \
-      --zone "${ZONE}" \
-      --timeout "${RESOLVER_TIMEOUT}" \
-      --max-probe "${RESOLVER_MAX_PROBE}" \
-      --concurrency "${RESOLVER_CONCURRENCY}" \
-      --take "${RESOLVER_TAKE}" \
-      --min-healthy "${RESOLVER_MIN_HEALTHY}" \
-      --allow-fallback
-  )"
+  PICKER_CMD=(
+    "${PYTHON_BIN}" "${BASE_DIR}/storm_resolver_picker.py"
+    --resolvers-file "${RESOLVER_FILE}"
+    --zone "${ZONE}"
+    --timeout "${RESOLVER_TIMEOUT}"
+    --max-probe "${RESOLVER_MAX_PROBE}"
+    --concurrency "${RESOLVER_CONCURRENCY}"
+    --sample-mode "${PICKER_SAMPLE_MODE}"
+    --take "${RESOLVER_TAKE}"
+    --min-healthy "${RESOLVER_MIN_HEALTHY}"
+  )
+  if [[ "${BOOTSTRAP_ALLOW_FALLBACK}" == "1" ]]; then
+    PICKER_CMD+=(--allow-fallback)
+  fi
+  SELECTED="$("${PICKER_CMD[@]}")"
 fi
 
 if [[ -z "${SELECTED}" ]]; then

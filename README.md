@@ -206,6 +206,18 @@ sudo systemctl enable --now storm-resolver-daemon
 sudo systemctl enable --now storm-client
 ```
 
+Daemon outputs (inside):
+```bash
+cat /opt/nexora-storm/state/resolvers_active.txt
+cat /opt/nexora-storm/state/resolvers_healthy.txt
+cat /opt/nexora-storm/state/resolver_daemon_state.json
+```
+
+Notes:
+- The daemon auto-scans a random subset of a large resolver pool each cycle.
+- No manual `/tmp/probe_*.json` loop is required.
+- `storm-client` reads `resolvers_active.txt` and restarts only when active set changes (with cooldown).
+
 ## Testing
 
 ```bash

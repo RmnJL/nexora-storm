@@ -16,6 +16,7 @@ import asyncio
 import ipaddress
 import os
 import secrets
+import random
 from dataclasses import asdict, dataclass
 import json
 from typing import Iterable
@@ -106,6 +107,27 @@ def rank_resolvers(results: list[ProbeResult], take: int) -> list[str]:
     return [r.resolver for r in ranked[: max(1, take)]]
 
 
+def choose_probe_candidates(
+    resolvers: list[str],
+    max_probe: int,
+    sample_mode: str,
+) -> list[str]:
+    if not resolvers:
+        return []
+
+    cap = max(1, max_probe)
+    if cap >= len(resolvers):
+        return list(resolvers)
+
+    if sample_mode == "head":
+        return list(resolvers[:cap])
+
+    if sample_mode == "random":
+        return random.sample(resolvers, cap)
+
+    raise ValueError(f"unsupported sample_mode: {sample_mode}")
+
+
 async def probe_pool(
     resolvers: list[str],
     zone: str,
@@ -113,8 +135,9 @@ async def probe_pool(
     timeout: float,
     max_probe: int,
     concurrency: int,
+    sample_mode: str = "head",
 ) -> list[ProbeResult]:
-    probe_set = resolvers[: max(1, max_probe)]
+    probe_set = choose_probe_candidates(resolvers, max_probe, sample_mode)
     transport = DNSTransport(zone=zone, qtype=qtype)
     sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -145,6 +168,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=1.5, help="Probe timeout in seconds")
     parser.add_argument("--max-probe", type=int, default=40, help="Probe only first N resolvers")
     parser.add_argument("--concurrency", type=int, default=15, help="Concurrent probes")
+    parser.add_argument(
+        "--sample-mode",
+        choices=["head", "random"],
+        default="random",
+        help="How to pick resolvers from pool when max-probe < pool size",
+    )
     parser.add_argument("--take", type=int, default=4, help="Select top N resolvers")
     parser.add_argument("--min-healthy", type=int, default=2, help="Minimum required healthy resolvers")
     parser.add_argument("--allow-fallback", action="store_true", help="Allow fallback when healthy count is low")
@@ -167,10 +196,24 @@ async def main() -> int:
         timeout=args.timeout,
         max_probe=args.max_probe,
         concurrency=args.concurrency,
+        sample_mode=args.sample_mode,
     )
 
     healthy = [r for r in results if r.ok]
     selected = rank_resolvers(healthy if healthy else results, args.take)
+    eligible = len(healthy) >= max(1, args.min_healthy) or args.allow_fallback
+
+    if args.json_out:
+        payload = {
+            "selected": selected,
+            "healthy_count": len(healthy),
+            "eligible": eligible,
+            "sample_mode": args.sample_mode,
+            "probed_count": len(results),
+            "results": [asdict(r) for r in results],
+        }
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
     if len(healthy) < max(1, args.min_healthy) and not args.allow_fallback:
         print(
@@ -178,15 +221,6 @@ async def main() -> int:
             "Use --allow-fallback to continue."
         )
         return 2
-
-    if args.json_out:
-        payload = {
-            "selected": selected,
-            "healthy_count": len(healthy),
-            "results": [asdict(r) for r in results],
-        }
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
 
     if args.env_out:
         write_env_file(args.env_out, selected)
@@ -197,4 +231,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

@@ -171,5 +171,8 @@ sudo journalctl -u storm-resolver-daemon -f
 
 ```bash
 cat /opt/nexora-storm/state/resolvers_active.txt
+cat /opt/nexora-storm/state/resolvers_healthy.txt
 cat /opt/nexora-storm/state/resolver_daemon_state.json
 ```
+
+نکته: با سرویس `storm-resolver-daemon` دیگر نیازی به loop دستی برای `probe_*.json` نیست؛ اسکن pool بزرگ resolver به‌صورت خودکار و دوره‌ای انجام می‌شود.

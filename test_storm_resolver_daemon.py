@@ -5,6 +5,7 @@ from storm_resolver_daemon import (
     compute_selection,
     format_active_resolvers,
     parse_active_resolvers_text,
+    select_probe_subset,
     should_restart,
     stabilize_selection,
 )
@@ -48,3 +49,18 @@ def test_atomic_write_text(tmp_path):
     atomic_write_text(str(target), format_active_resolvers(["1.1.1.1", "8.8.8.8"]))
     assert target.read_text(encoding="utf-8") == "1.1.1.1 8.8.8.8\n"
 
+
+def test_select_probe_subset_keeps_sticky_and_caps_size():
+    pool = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4", "208.67.222.222"]
+    prev = ["8.8.8.8", "9.9.9.9"]
+    subset, cursor = select_probe_subset(
+        pool=pool,
+        previous_active=prev,
+        max_probe=3,
+        probe_mode="sequential",
+        sticky_keep=2,
+        cursor=0,
+    )
+    assert subset[:2] == ["8.8.8.8", "9.9.9.9"]
+    assert len(subset) == 3
+    assert cursor >= 0
