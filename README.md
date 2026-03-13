@@ -195,15 +195,29 @@ Use provided systemd units:
 - `systemd/storm-client.service`
 - `systemd/storm-resolver-daemon.service` (inside resolver manager)
 
-Install:
+Recommended (auto-sync + validation):
 ```bash
-sudo cp systemd/storm-server.service /etc/systemd/system/
-sudo cp systemd/storm-resolver-daemon.service /etc/systemd/system/
-sudo cp systemd/storm-client.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now storm-server
-sudo systemctl enable --now storm-resolver-daemon
-sudo systemctl enable --now storm-client
+# Outside server
+sudo /opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_stack_doctor.py \
+  --role outside \
+  --base-dir /opt/nexora-storm \
+  --zone t1.phonexpress.ir \
+  --apply
+
+# Inside server
+sudo /opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_stack_doctor.py \
+  --role inside \
+  --base-dir /opt/nexora-storm \
+  --zone t1.phonexpress.ir \
+  --apply
+```
+
+Dry-run (check only, no changes):
+```bash
+/opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_stack_doctor.py \
+  --role inside \
+  --base-dir /opt/nexora-storm \
+  --zone t1.phonexpress.ir
 ```
 
 Daemon outputs (inside):
@@ -217,6 +231,7 @@ Notes:
 - The daemon auto-scans a random subset of a large resolver pool each cycle.
 - No manual `/tmp/probe_*.json` loop is required.
 - `storm-client` reads `resolvers_active.txt` and restarts only when active set changes (with cooldown).
+- `storm-server` service exists only on outside; inside should run `storm-client` + `storm-resolver-daemon`.
 
 ## Testing
 
