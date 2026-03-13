@@ -74,3 +74,41 @@ def test_load_previous_report_parses_rows_and_resolver_list(tmp_path):
     assert rows[0].resolver == "1.1.1.1"
     assert resolver_list == ["1.1.1.1", "8.8.8.8"]
     assert ts == 123.0
+
+
+def test_load_previous_report_filters_quarantine_rows(tmp_path):
+    path = tmp_path / "scan.json"
+    payload = {
+        "timestamp_ts": 456.0,
+        "resolvers": [
+            {
+                "resolver": "1.1.1.1",
+                "ok": True,
+                "successes": 2,
+                "probes": 2,
+                "pass_rate": 1.0,
+                "latency_ms": 20.0,
+                "score": 980.0,
+                "error": "",
+                "pool": "active",
+            },
+            {
+                "resolver": "8.8.8.8",
+                "ok": False,
+                "successes": 0,
+                "probes": 2,
+                "pass_rate": 0.0,
+                "latency_ms": 1500.0,
+                "score": -500.0,
+                "error": "no-response",
+                "pool": "quarantine",
+            },
+        ],
+        "resolver_list": ["1.1.1.1", "8.8.8.8"],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    rows, resolver_list, ts = _load_previous_report(str(path))
+    assert len(rows) == 1
+    assert rows[0].resolver == "1.1.1.1"
+    assert resolver_list == ["1.1.1.1", "8.8.8.8"]
+    assert ts == 456.0

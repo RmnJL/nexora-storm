@@ -162,9 +162,11 @@ def _load_previous_report(path: str) -> tuple[list[ScanRow], list[str], float]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        rows = _dicts_to_rows(data.get("resolvers", []))
+        rows_all = _dicts_to_rows(data.get("resolvers", []))
+        rows = [r for r in rows_all if r.ok and str(r.pool).lower() in {"active", "standby", ""}]
         resolver_list = _dedupe_resolvers(data.get("resolver_list", []))
         ts = float(data.get("timestamp_ts", 0.0) or 0.0)
+        rows.sort(key=_row_rank_key)
         return rows, resolver_list, ts
     except Exception:
         return [], [], 0.0
@@ -310,7 +312,10 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         active_pool_size=args.active_pool_size,
         standby_pool_size=args.standby_pool_size,
     )
-    marked_rows = _mark_row_pools(publish_rows + failed_rows, set(active), set(standby))
+    active_set = set(active)
+    standby_set = set(standby)
+    marked_publish_rows = _mark_row_pools(publish_rows, active_set, standby_set)
+    marked_quarantine_rows = _mark_row_pools(failed_rows, set(), set())
 
     resolver_list = _build_resolver_list(
         active=active,
@@ -343,7 +348,10 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "standby": standby,
             "quarantine": quarantine,
         },
-        "resolvers": _rows_to_dicts(marked_rows),
+        # Keep published resolvers strictly limited to active/standby candidates.
+        # Quarantine is exposed separately to avoid feedback loops across rollback cycles.
+        "resolvers": _rows_to_dicts(marked_publish_rows),
+        "quarantine_resolvers": _rows_to_dicts(marked_quarantine_rows),
         "resolver_list": resolver_list,
     }
     return report
