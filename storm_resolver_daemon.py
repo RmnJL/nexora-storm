@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import asdict
+import ipaddress
 import json
 import logging
 import os
@@ -34,6 +35,93 @@ def parse_active_resolvers_text(text: str) -> list[str]:
             seen.add(token)
             out.append(token)
     return out
+
+
+def _is_public_ipv4(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+        return addr.version == 4 and addr.is_global
+    except ValueError:
+        return False
+
+
+def _dedupe_public_ipv4(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        ip = str(raw).strip()
+        if not ip or ip in seen:
+            continue
+        if not _is_public_ipv4(ip):
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
+def _parse_allowed_pools(raw: str) -> set[str]:
+    pools = {x.strip().lower() for x in str(raw).split(",") if x.strip()}
+    if not pools:
+        return {"active", "standby"}
+    return pools
+
+
+def load_scanner_resolvers(
+    scanner_json: str,
+    min_pass_rate: float,
+    max_latency_ms: float,
+    min_score: float,
+    max_stale_sec: float,
+    allowed_pools: set[str],
+) -> list[str]:
+    if not scanner_json or not os.path.isfile(scanner_json):
+        return []
+    try:
+        with open(scanner_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    now_ts = time.time()
+    report_ts = float(data.get("timestamp_ts", 0.0) or 0.0)
+    if max_stale_sec > 0 and report_ts > 0 and (now_ts - report_ts) > max_stale_sec:
+        return []
+
+    rows_raw = data.get("resolvers", [])
+    selected: list[str] = []
+    seen: set[str] = set()
+    if isinstance(rows_raw, list):
+        for item in rows_raw:
+            if not isinstance(item, dict):
+                continue
+            ip = str(item.get("resolver", "")).strip()
+            if not _is_public_ipv4(ip) or ip in seen:
+                continue
+
+            pool = str(item.get("pool", "")).strip().lower()
+            if allowed_pools and pool and pool not in allowed_pools:
+                continue
+
+            pass_rate = float(item.get("pass_rate", 0.0) or 0.0)
+            latency_ms = float(item.get("latency_ms", 0.0) or 0.0)
+            score = float(item.get("score", 0.0) or 0.0)
+            if pass_rate < min_pass_rate:
+                continue
+            if max_latency_ms > 0 and latency_ms > max_latency_ms:
+                continue
+            if score < min_score:
+                continue
+
+            seen.add(ip)
+            selected.append(ip)
+
+    if selected:
+        return selected
+
+    fallback_list = data.get("resolver_list", [])
+    if isinstance(fallback_list, list):
+        return _dedupe_public_ipv4([str(x) for x in fallback_list])
+    return []
 
 
 def load_active_resolvers(path: str) -> list[str]:
@@ -158,7 +246,16 @@ class ResolverDaemon:
         self.probe_cursor = 0
 
     async def run_once(self) -> dict[str, Any]:
-        pool = load_resolvers_file(self.args.resolvers_file)
+        scanner_pool = load_scanner_resolvers(
+            scanner_json=self.args.scanner_json,
+            min_pass_rate=self.args.scanner_min_pass_rate,
+            max_latency_ms=self.args.scanner_max_latency_ms,
+            min_score=self.args.scanner_min_score,
+            max_stale_sec=self.args.scanner_max_stale_sec,
+            allowed_pools=_parse_allowed_pools(self.args.scanner_pools),
+        )
+        pool_source = "scanner" if scanner_pool else "resolvers-file"
+        pool = scanner_pool if scanner_pool else load_resolvers_file(self.args.resolvers_file)
         if not pool:
             raise RuntimeError("no valid resolvers in resolver file")
 
@@ -219,7 +316,9 @@ class ResolverDaemon:
 
         state = {
             "timestamp": time.time(),
+            "pool_source": pool_source,
             "pool_size": len(pool),
+            "scanner_pool_size": len(scanner_pool),
             "probed_count": len(probe_set),
             "probe_mode": self.args.probe_mode,
             "healthy_count": healthy_count,
@@ -285,6 +384,12 @@ class ResolverDaemon:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="STORM resolver background daemon")
     parser.add_argument("--resolvers-file", default="data/resolvers.txt")
+    parser.add_argument("--scanner-json", default="state/resolvers_scan.json")
+    parser.add_argument("--scanner-min-pass-rate", type=float, default=0.55)
+    parser.add_argument("--scanner-max-latency-ms", type=float, default=900.0)
+    parser.add_argument("--scanner-min-score", type=float, default=0.0)
+    parser.add_argument("--scanner-max-stale-sec", type=float, default=900.0)
+    parser.add_argument("--scanner-pools", default="active,standby")
     parser.add_argument("--active-out", default="state/resolvers_active.txt")
     parser.add_argument("--state-json", default="state/resolver_daemon_state.json")
     parser.add_argument("--zone", default="t1.phonexpress.ir")

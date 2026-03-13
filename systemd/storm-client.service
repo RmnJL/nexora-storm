@@ -1,7 +1,7 @@
 [Unit]
 Description=STORM Inside Client (Auto Resolver Selection)
-After=network-online.target storm-resolver-daemon.service
-Wants=network-online.target storm-resolver-daemon.service
+After=network-online.target storm-resolver-scanner.service storm-resolver-daemon.service
+Wants=network-online.target storm-resolver-scanner.service storm-resolver-daemon.service
 
 [Service]
 Type=simple

@@ -43,7 +43,7 @@ def test_patch_base_dir_in_unit_replaces_default_path():
 
 
 def test_services_for_role_mapping():
-    assert services_for_role("inside") == ["storm-resolver-daemon", "storm-client"]
+    assert services_for_role("inside") == ["storm-resolver-scanner", "storm-resolver-daemon", "storm-client"]
     assert services_for_role("outside") == ["storm-server"]
 
 

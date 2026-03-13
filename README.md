@@ -149,6 +149,7 @@ Active probe tool:
 - `storm_health_check.py`
 - `storm_resolver_picker.py` (selects healthy resolvers from `data/resolvers.txt`)
 - `storm_resolver_daemon.py` (keeps active resolver set fresh in background)
+- `storm_resolver_scanner.py` (builds active/standby/quarantine pools with rollback-safe publish)
 
 ### Client (Inside Server)
 
@@ -193,6 +194,7 @@ python storm_server.py \
 Use provided systemd units:
 - `systemd/storm-server.service`
 - `systemd/storm-client.service`
+- `systemd/storm-resolver-scanner.service` (inside quality scanner sidecar)
 - `systemd/storm-resolver-daemon.service` (inside resolver manager)
 
 Recommended (auto-sync + validation):
@@ -222,16 +224,18 @@ Dry-run (check only, no changes):
 
 Daemon outputs (inside):
 ```bash
+cat /opt/nexora-storm/state/resolvers_scan.json
 cat /opt/nexora-storm/state/resolvers_active.txt
 cat /opt/nexora-storm/state/resolvers_healthy.txt
 cat /opt/nexora-storm/state/resolver_daemon_state.json
 ```
 
 Notes:
+- The scanner sidecar publishes active/standby/quarantine pools with rollback protection.
 - The daemon auto-scans a random subset of a large resolver pool each cycle.
 - No manual `/tmp/probe_*.json` loop is required.
 - `storm-client` reads `resolvers_active.txt` and restarts only when active set changes (with cooldown).
-- `storm-server` service exists only on outside; inside should run `storm-client` + `storm-resolver-daemon`.
+- `storm-server` service exists only on outside; inside should run `storm-resolver-scanner` + `storm-resolver-daemon` + `storm-client`.
 
 ## Testing
 

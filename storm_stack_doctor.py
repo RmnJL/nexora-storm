@@ -21,6 +21,7 @@ DEFAULT_BASE_DIR = "/opt/nexora-storm"
 ZONE_ARG_RE = re.compile(r"(--zone\s+)(\S+)")
 UNIT_NAME_BY_SERVICE = {
     "storm-client": "storm-client.service",
+    "storm-resolver-scanner": "storm-resolver-scanner.service",
     "storm-resolver-daemon": "storm-resolver-daemon.service",
     "storm-server": "storm-server.service",
 }
@@ -69,7 +70,7 @@ def patch_service_env_var(text: str, key: str, value: str) -> tuple[str, bool]:
 
 def services_for_role(role: str) -> list[str]:
     if role == "inside":
-        return ["storm-resolver-daemon", "storm-client"]
+        return ["storm-resolver-scanner", "storm-resolver-daemon", "storm-client"]
     if role == "outside":
         return ["storm-server"]
     raise ValueError(f"unsupported role: {role}")
@@ -82,9 +83,11 @@ def required_paths(base_dir: Path, role: str) -> list[Path]:
             base_dir / "storm_client.py",
             base_dir / "storm_resolver_picker.py",
             base_dir / "storm_resolver_daemon.py",
+            base_dir / "storm_resolver_scanner.py",
             base_dir / "run_storm_client_auto.sh",
             base_dir / "data" / "resolvers.txt",
             base_dir / "systemd" / "storm-client.service",
+            base_dir / "systemd" / "storm-resolver-scanner.service",
             base_dir / "systemd" / "storm-resolver-daemon.service",
         ]
     if role == "outside":
@@ -162,12 +165,20 @@ def systemctl_available() -> bool:
 def expected_exec_tokens(service: str, zone: str, base_dir: str) -> list[str]:
     if service == "storm-client":
         return [f"{base_dir}/run_storm_client_auto.sh"]
+    if service == "storm-resolver-scanner":
+        return [
+            f"{base_dir}/storm_resolver_scanner.py",
+            f"--zone {zone}",
+            "--output",
+            "--max-probe 300",
+        ]
     if service == "storm-resolver-daemon":
         return [
             f"{base_dir}/storm_resolver_daemon.py",
             f"--zone {zone}",
             "--probe-mode random",
             "--max-probe 300",
+            "--scanner-json",
             "--healthy-out",
         ]
     if service == "storm-server":
