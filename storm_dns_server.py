@@ -110,6 +110,10 @@ class STORMDNSServer:
                         response_wire = response.to_wire()
                         sock.sendto(response_wire, client_addr)
                         log.debug(f"sent response to {client_addr}: {len(response_wire)} bytes")
+                    else:
+                        # Invalid or rejected STORM packet should still get DNS reply.
+                        response = self._make_nxdomain(query)
+                        sock.sendto(response.to_wire(), client_addr)
                 else:
                     # No handler, send NXDOMAIN
                     response = self._make_nxdomain(query)
@@ -161,8 +165,15 @@ class STORMDNSServer:
             from storm_dns import DNSTransport
             for encoded_str in candidates:
                 try:
-                    return DNSTransport.decode_packet(encoded_str)
+                    decoded = DNSTransport.decode_packet(encoded_str)
+                    # Accept only valid STORM wire packets. This avoids
+                    # accidental base32-looking labels (e.g. "test") causing
+                    # silent no-response paths.
+                    parse_packet(decoded)
+                    return decoded
                 except ValueError:
+                    continue
+                except Exception:
                     continue
             return None
         
