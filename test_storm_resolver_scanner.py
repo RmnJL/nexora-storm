@@ -8,6 +8,8 @@ from storm_resolver_scanner import (
     _classify_pools,
     _dedupe_resolvers,
     _load_previous_report,
+    _select_probe_candidates,
+    _select_sticky_candidates,
 )
 
 
@@ -112,3 +114,37 @@ def test_load_previous_report_filters_quarantine_rows(tmp_path):
     assert rows[0].resolver == "1.1.1.1"
     assert resolver_list == ["1.1.1.1", "8.8.8.8"]
     assert ts == 456.0
+
+
+def test_select_probe_candidates_sequential_rotates_cursor():
+    src = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"]
+    picks1, cursor1 = _select_probe_candidates(
+        source_candidates=src,
+        max_probe=2,
+        sample_mode="sequential",
+        cursor=0,
+    )
+    picks2, cursor2 = _select_probe_candidates(
+        source_candidates=src,
+        max_probe=2,
+        sample_mode="sequential",
+        cursor=cursor1,
+    )
+    assert picks1 == ["1.1.1.1", "2.2.2.2"]
+    assert picks2 == ["3.3.3.3", "4.4.4.4"]
+    assert cursor2 == 4
+
+
+def test_select_sticky_candidates_uses_previous_active_and_standby():
+    previous = [
+        ScanRow("9.9.9.9", True, 2, 2, 1.0, 25.0, 975.0, "", "active"),
+        ScanRow("8.8.8.8", True, 2, 2, 1.0, 35.0, 965.0, "", "standby"),
+        ScanRow("4.4.4.4", True, 2, 2, 1.0, 45.0, 955.0, "", "quarantine"),
+    ]
+    sticky = _select_sticky_candidates(
+        previous_rows=previous,
+        source_candidates=["8.8.8.8", "9.9.9.9", "1.1.1.1"],
+        sticky_rows=4,
+        sticky_pools={"active", "standby"},
+    )
+    assert sticky == ["9.9.9.9", "8.8.8.8"]

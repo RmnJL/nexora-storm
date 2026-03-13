@@ -94,6 +94,85 @@ def _dicts_to_rows(rows: list[dict[str, Any]]) -> list[ScanRow]:
     return out
 
 
+def _load_cursor(path: str) -> int:
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        return max(0, int(raw or "0"))
+    except Exception:
+        return 0
+
+
+def _save_cursor(path: str, cursor: int) -> None:
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"{max(0, int(cursor))}\n")
+    os.replace(tmp, path)
+
+
+def _select_sticky_candidates(
+    previous_rows: list[ScanRow],
+    source_candidates: list[str],
+    sticky_rows: int,
+    sticky_pools: set[str],
+) -> list[str]:
+    if sticky_rows <= 0 or not previous_rows:
+        return []
+    source_set = set(source_candidates)
+    ranked_prev = sorted(previous_rows, key=_row_rank_key)
+    selected: list[str] = []
+    for row in ranked_prev:
+        if len(selected) >= sticky_rows:
+            break
+        pool = str(row.pool).strip().lower()
+        if sticky_pools and pool and pool not in sticky_pools:
+            continue
+        if row.resolver not in source_set:
+            continue
+        if row.resolver in selected:
+            continue
+        selected.append(row.resolver)
+    return selected
+
+
+def _select_probe_candidates(
+    source_candidates: list[str],
+    max_probe: int,
+    sample_mode: str,
+    cursor: int,
+) -> tuple[list[str], int]:
+    if not source_candidates:
+        return [], cursor
+
+    cap = min(max(1, int(max_probe)), len(source_candidates))
+    if cap >= len(source_candidates):
+        return list(source_candidates), 0
+
+    if sample_mode in {"head", "random"}:
+        picks = choose_probe_candidates(
+            source_candidates,
+            max_probe=cap,
+            sample_mode=sample_mode,
+        )
+        return _dedupe_resolvers(picks), cursor
+
+    if sample_mode == "sequential":
+        start = cursor % len(source_candidates)
+        rotated = source_candidates[start:] + source_candidates[:start]
+        picks = rotated[:cap]
+        new_cursor = (start + cap) % len(source_candidates)
+        return _dedupe_resolvers(picks), new_cursor
+
+    raise ValueError(f"unsupported sample_mode: {sample_mode}")
+
+
 def _classify_pools(
     publish_rows: list[ScanRow],
     failed_rows: list[ScanRow],
@@ -261,12 +340,25 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
     if not source_candidates:
         raise RuntimeError("no valid resolvers found in resolver file")
 
-    candidates = choose_probe_candidates(
-        source_candidates,
+    prev_rows, prev_resolver_list, prev_ts = _load_previous_report(args.output)
+
+    cursor = int(getattr(args, "_sample_cursor", 0))
+    sampled, new_cursor = _select_probe_candidates(
+        source_candidates=source_candidates,
         max_probe=args.max_probe,
         sample_mode=args.sample_mode,
+        cursor=cursor,
     )
-    candidates = _dedupe_resolvers(candidates)
+    sticky_candidates = _select_sticky_candidates(
+        previous_rows=prev_rows,
+        source_candidates=source_candidates,
+        sticky_rows=args.sticky_rows,
+        sticky_pools={x.strip().lower() for x in str(args.sticky_pools).split(",") if x.strip()},
+    )
+    merged_candidates = sticky_candidates + sampled + source_candidates
+    candidates = _dedupe_resolvers(merged_candidates)[: max(1, int(args.max_probe))]
+    setattr(args, "_sample_cursor", new_cursor)
+    _save_cursor(args.sample_cursor_file, new_cursor)
     if not candidates:
         raise RuntimeError("no valid public resolver candidates selected")
 
@@ -297,7 +389,6 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
     ]
     failed_rows = [row for row in rows if row.resolver not in {r.resolver for r in publish_rows}]
 
-    prev_rows, prev_resolver_list, prev_ts = _load_previous_report(args.output)
     now_ts = time.time()
     min_publish = max(2, min(4, max(1, int(args.active_pool_size))))
     rollback_used = False
@@ -338,6 +429,9 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "publish_min_score": args.publish_min_score,
             "rounds": args.rounds,
             "min_success": args.min_success,
+            "sample_mode": args.sample_mode,
+            "sample_cursor": new_cursor,
+            "sticky_rows": args.sticky_rows,
             "global_pass_rate_avg": round(
                 statistics.mean([row.pass_rate for row in rows]) if rows else 0.0,
                 4,
@@ -384,12 +478,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="STORM resolver scanner sidecar")
     parser.add_argument("--resolvers-file", default="data/resolvers.txt")
     parser.add_argument("--output", default="state/resolvers_scan.json")
+    parser.add_argument("--sample-cursor-file", default="state/resolvers_scan_cursor.txt")
     parser.add_argument("--zone", default="t1.phonexpress.ir")
     parser.add_argument("--qtype", default="TXT")
     parser.add_argument("--timeout", type=float, default=1.5)
     parser.add_argument("--concurrency", type=int, default=40)
     parser.add_argument("--max-probe", type=int, default=400)
-    parser.add_argument("--sample-mode", choices=["head", "random"], default="random")
+    parser.add_argument("--sample-mode", choices=["head", "random", "sequential"], default="sequential")
+    parser.add_argument("--sticky-rows", type=int, default=64)
+    parser.add_argument("--sticky-pools", default="active,standby")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--min-success", type=int, default=1)
     parser.add_argument("--active-pool-size", type=int, default=12)
@@ -405,6 +502,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> int:
     args = parse_args()
+    setattr(args, "_sample_cursor", _load_cursor(args.sample_cursor_file))
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
