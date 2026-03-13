@@ -1,0 +1,20 @@
+[Unit]
+Description=STORM Outside DNS Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nexora-storm
+ExecStart=/opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_server.py --listen 0.0.0.0:53 --target 127.0.0.1:10000 --zone t1.phonexpress.ir
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

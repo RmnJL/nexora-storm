@@ -112,3 +112,53 @@ python storm_health_check.py \
 1. route داخل Xray را موقتاً از `storm-out` برگردان به outbound قبلی.
 2. سرویس‌های `storm_client` و `storm_server` را stop کن.
 3. بعد از رفع مشکل دوباره health-check اجرا کن.
+
+## 10) انتخاب resolver سالم از `data/resolvers.txt` (inside)
+
+برای اینکه داخل به DNS ثابت (مثل `1.1.1.1`) وابسته نباشد، از ابزار picker استفاده کن:
+
+```bash
+cd /opt/nexora-storm
+source .venv/bin/activate
+python storm_resolver_picker.py \
+  --resolvers-file data/resolvers.txt \
+  --zone t1.phonexpress.ir \
+  --timeout 1.5 \
+  --max-probe 40 \
+  --concurrency 15 \
+  --take 4 \
+  --min-healthy 2 \
+  --json-out resolver_probe_report.json
+```
+
+خروجی دستور، لیست resolver انتخاب‌شده است (space-separated) که می‌تواند مستقیم به `storm_client.py --resolvers ...` داده شود.
+
+## 11) اجرای دائم بدون SSH (systemd)
+
+### خارج (outside)
+
+```bash
+cd /opt/nexora-storm
+sudo cp systemd/storm-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now storm-server
+sudo systemctl status storm-server --no-pager
+```
+
+### داخل (inside)
+
+```bash
+cd /opt/nexora-storm
+chmod +x run_storm_client_auto.sh
+sudo cp systemd/storm-client.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now storm-client
+sudo systemctl status storm-client --no-pager
+```
+
+لاگ‌ها:
+
+```bash
+sudo journalctl -u storm-server -f
+sudo journalctl -u storm-client -f
+```

@@ -147,6 +147,7 @@ Operational runbook:
 
 Active probe tool:
 - `storm_health_check.py`
+- `storm_resolver_picker.py` (selects healthy resolvers from `data/resolvers.txt`)
 
 ### Client (Inside Server)
 
@@ -162,6 +163,21 @@ export SOCKS5_PROXY=127.0.0.1:1443
 curl -x socks5h://127.0.0.1:1443 http://example.com
 ```
 
+### Client (Inside, Auto Resolver Pick From File)
+
+```bash
+# Select healthy resolvers from file (prints space-separated list)
+python storm_resolver_picker.py \
+  --resolvers-file data/resolvers.txt \
+  --zone t1.phonexpress.ir \
+  --take 4 \
+  --min-healthy 2
+
+# Start client with auto-picked resolvers (helper script)
+chmod +x run_storm_client_auto.sh
+./run_storm_client_auto.sh
+```
+
 ### Server (Outside Server)
 
 ```bash
@@ -169,6 +185,21 @@ curl -x socks5h://127.0.0.1:1443 http://example.com
 python storm_server.py \
   --listen 0.0.0.0:53 \
   --target 127.0.0.1:8443
+```
+
+### Run As Background Services (No SSH Session Needed)
+
+Use provided systemd units:
+- `systemd/storm-server.service`
+- `systemd/storm-client.service`
+
+Install:
+```bash
+sudo cp systemd/storm-server.service /etc/systemd/system/
+sudo cp systemd/storm-client.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now storm-server
+sudo systemctl enable --now storm-client
 ```
 
 ## Testing
