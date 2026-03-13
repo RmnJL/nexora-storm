@@ -43,6 +43,24 @@ def test_compute_selection_strict_mode_fails_on_low_health():
     assert not eligible
 
 
+def test_compute_selection_fills_to_take_with_fallback_ranked_results():
+    results = [
+        ProbeResult(resolver="1.1.1.1", ok=True, latency_ms=20.0),
+        ProbeResult(resolver="8.8.8.8", ok=False, latency_ms=200.0, error="no-response"),
+        ProbeResult(resolver="9.9.9.9", ok=False, latency_ms=400.0, error="no-response"),
+    ]
+    selected, healthy_count, eligible = compute_selection(
+        results=results,
+        take=3,
+        min_healthy=1,
+        allow_fallback=False,
+    )
+    assert eligible
+    assert healthy_count == 1
+    assert len(selected) == 3
+    assert selected[0] == "1.1.1.1"
+
+
 def test_should_restart_honors_cooldown():
     assert should_restart(last_restart_at=0.0, now=20.0, cooldown=10.0)
     assert not should_restart(last_restart_at=15.0, now=20.0, cooldown=10.0)

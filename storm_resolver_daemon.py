@@ -173,14 +173,30 @@ def compute_selection(
     min_healthy: int,
     allow_fallback: bool,
 ) -> tuple[list[str], int, bool]:
+    target_len = max(1, take)
     healthy = [r for r in results if r.ok]
     healthy_count = len(healthy)
 
     if healthy_count < max(1, min_healthy) and not allow_fallback:
         return [], healthy_count, False
 
+    # Prefer healthy resolvers, but do not collapse active set to a single node
+    # under lossy conditions. Fill the remaining slots from the ranked fallback
+    # pool to preserve multipath behavior on restricted networks.
     basis = healthy if healthy else results
-    return rank_resolvers(basis, take), healthy_count, True
+    selected = rank_resolvers(basis, target_len)
+    if len(selected) < target_len:
+        seen = set(selected)
+        fallback_ranked = rank_resolvers(results, max(target_len * 3, target_len))
+        for resolver in fallback_ranked:
+            if resolver in seen:
+                continue
+            selected.append(resolver)
+            seen.add(resolver)
+            if len(selected) >= target_len:
+                break
+
+    return selected[:target_len], healthy_count, True
 
 
 def should_restart(last_restart_at: float, now: float, cooldown: float) -> bool:
