@@ -5,9 +5,12 @@ import json
 from storm_resolver_scanner import (
     ScanRow,
     _build_resolver_list,
+    _build_prefilter_candidates,
     _classify_pools,
     _dedupe_resolvers,
     _load_previous_report,
+    _resolve_phase1_limits,
+    _select_quick_survivors,
     _select_probe_candidates,
     _select_sticky_candidates,
 )
@@ -148,3 +151,53 @@ def test_select_sticky_candidates_uses_previous_active_and_standby():
         sticky_pools={"active", "standby"},
     )
     assert sticky == ["9.9.9.9", "8.8.8.8"]
+
+
+def test_resolve_phase1_limits_auto_uses_deep_probe_as_floor():
+    deep_cap, prefilter_cap, quick_probe_cap, quick_keep_cap = _resolve_phase1_limits(
+        max_probe=300,
+        prefilter_keep=0,
+        quick_max_probe=0,
+        quick_keep=0,
+    )
+    assert deep_cap == 300
+    assert prefilter_cap >= 1000
+    assert quick_probe_cap >= deep_cap
+    assert quick_probe_cap <= prefilter_cap
+    assert quick_keep_cap == deep_cap
+
+
+def test_build_prefilter_candidates_prioritizes_sticky_then_history():
+    previous = [
+        ScanRow("9.9.9.9", True, 2, 2, 1.0, 30.0, 970.0, "", "active"),
+        ScanRow("8.8.8.8", True, 2, 2, 1.0, 40.0, 960.0, "", "standby"),
+    ]
+    out = _build_prefilter_candidates(
+        source_candidates=["1.1.1.1", "8.8.8.8", "4.4.4.4"],
+        sampled_candidates=["4.4.4.4"],
+        sticky_candidates=["8.8.8.8"],
+        previous_rows=previous,
+        previous_resolver_list=["7.7.7.7"],
+        prefilter_keep=5,
+        prefilter_history_rows=2,
+    )
+    assert out == ["8.8.8.8", "9.9.9.9", "4.4.4.4", "7.7.7.7", "1.1.1.1"]
+
+
+def test_select_quick_survivors_prefers_healthy_rows():
+    rows = [
+        ScanRow("1.1.1.1", False, 0, 1, 0.0, 1200.0, -200.0, "no-response"),
+        ScanRow("8.8.8.8", True, 1, 1, 1.0, 200.0, 800.0, ""),
+        ScanRow("9.9.9.9", True, 1, 1, 1.0, 150.0, 850.0, ""),
+    ]
+    out = _select_quick_survivors(rows, keep=2)
+    assert out == ["9.9.9.9", "8.8.8.8"]
+
+
+def test_select_quick_survivors_falls_back_when_everything_fails():
+    rows = [
+        ScanRow("1.1.1.1", False, 0, 1, 0.0, 400.0, -400.0, "no-response"),
+        ScanRow("8.8.8.8", False, 0, 1, 0.0, 700.0, -700.0, "no-response"),
+    ]
+    out = _select_quick_survivors(rows, keep=1)
+    assert out == ["1.1.1.1"]

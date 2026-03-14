@@ -173,6 +173,97 @@ def _select_probe_candidates(
     raise ValueError(f"unsupported sample_mode: {sample_mode}")
 
 
+def _resolve_phase1_limits(
+    max_probe: int,
+    prefilter_keep: int,
+    quick_max_probe: int,
+    quick_keep: int,
+) -> tuple[int, int, int, int]:
+    deep_cap = max(1, int(max_probe))
+
+    if int(prefilter_keep) > 0:
+        prefilter_cap = max(deep_cap, int(prefilter_keep))
+    else:
+        prefilter_cap = max(1000, deep_cap * 4)
+
+    if int(quick_max_probe) > 0:
+        quick_probe_cap = min(prefilter_cap, max(1, int(quick_max_probe)))
+    else:
+        quick_probe_cap = min(prefilter_cap, max(deep_cap, deep_cap * 3))
+
+    if int(quick_keep) > 0:
+        quick_keep_cap = min(prefilter_cap, max(1, int(quick_keep)))
+    else:
+        quick_keep_cap = deep_cap
+
+    return deep_cap, prefilter_cap, quick_probe_cap, quick_keep_cap
+
+
+def _build_prefilter_candidates(
+    source_candidates: list[str],
+    sampled_candidates: list[str],
+    sticky_candidates: list[str],
+    previous_rows: list[ScanRow],
+    previous_resolver_list: list[str],
+    prefilter_keep: int,
+    prefilter_history_rows: int,
+) -> list[str]:
+    merged: list[str] = []
+    merged.extend(sticky_candidates)
+    if prefilter_history_rows > 0:
+        ranked_prev = sorted(previous_rows, key=_row_rank_key)
+        merged.extend(r.resolver for r in ranked_prev[: max(1, int(prefilter_history_rows))])
+    merged.extend(sampled_candidates)
+    merged.extend(previous_resolver_list)
+    merged.extend(source_candidates)
+    return _dedupe_resolvers(merged)[: max(1, int(prefilter_keep))]
+
+
+async def _run_quick_phase(
+    transport: DNSTransport,
+    candidates: list[str],
+    timeout: float,
+    concurrency: int,
+    max_probe: int,
+) -> list[ScanRow]:
+    if not candidates or max_probe <= 0:
+        return []
+    probe_set = candidates[: max(1, int(max_probe))]
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _run(ip: str) -> ScanRow:
+        async with sem:
+            ok, latency_ms, err = await _probe_once(transport, ip, timeout)
+            pass_rate = 1.0 if ok else 0.0
+            return ScanRow(
+                resolver=ip,
+                ok=ok,
+                successes=1 if ok else 0,
+                probes=1,
+                pass_rate=pass_rate,
+                latency_ms=round(latency_ms, 2),
+                score=round((pass_rate * 1000.0) - latency_ms, 2),
+                error=err if not ok else "",
+            )
+
+    tasks = [asyncio.create_task(_run(ip)) for ip in probe_set]
+    rows = await asyncio.gather(*tasks)
+    rows.sort(key=lambda row: (0 if row.ok else 1, row.latency_ms, row.resolver))
+    return rows
+
+
+def _select_quick_survivors(rows: list[ScanRow], keep: int) -> list[str]:
+    if keep <= 0 or not rows:
+        return []
+    cap = max(1, int(keep))
+    ranked = sorted(rows, key=lambda row: (0 if row.ok else 1, row.latency_ms, row.resolver))
+    healthy = [row.resolver for row in ranked if row.ok][:cap]
+    if healthy:
+        return healthy
+    # Fallback: keep the quickest rows if quick phase is fully blocked.
+    return [row.resolver for row in ranked[:cap]]
+
+
 def _classify_pools(
     publish_rows: list[ScanRow],
     failed_rows: list[ScanRow],
@@ -340,12 +431,24 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
     if not source_candidates:
         raise RuntimeError("no valid resolvers found in resolver file")
 
+    (
+        deep_probe_cap,
+        prefilter_cap,
+        quick_probe_cap,
+        quick_keep_cap,
+    ) = _resolve_phase1_limits(
+        max_probe=args.max_probe,
+        prefilter_keep=args.prefilter_keep,
+        quick_max_probe=args.quick_max_probe,
+        quick_keep=args.quick_keep,
+    )
+
     prev_rows, prev_resolver_list, prev_ts = _load_previous_report(args.output)
 
     cursor = int(getattr(args, "_sample_cursor", 0))
     sampled, new_cursor = _select_probe_candidates(
         source_candidates=source_candidates,
-        max_probe=args.max_probe,
+        max_probe=deep_probe_cap,
         sample_mode=args.sample_mode,
         cursor=cursor,
     )
@@ -355,14 +458,34 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         sticky_rows=args.sticky_rows,
         sticky_pools={x.strip().lower() for x in str(args.sticky_pools).split(",") if x.strip()},
     )
-    merged_candidates = sticky_candidates + sampled + source_candidates
-    candidates = _dedupe_resolvers(merged_candidates)[: max(1, int(args.max_probe))]
+    prefilter_candidates = _build_prefilter_candidates(
+        source_candidates=source_candidates,
+        sampled_candidates=sampled,
+        sticky_candidates=sticky_candidates,
+        previous_rows=prev_rows,
+        previous_resolver_list=prev_resolver_list,
+        prefilter_keep=prefilter_cap,
+        prefilter_history_rows=args.prefilter_history_rows,
+    )
     setattr(args, "_sample_cursor", new_cursor)
     _save_cursor(args.sample_cursor_file, new_cursor)
-    if not candidates:
+    if not prefilter_candidates:
         raise RuntimeError("no valid public resolver candidates selected")
 
     transport = DNSTransport(zone=args.zone, qtype=args.qtype)
+    quick_rows = await _run_quick_phase(
+        transport=transport,
+        candidates=prefilter_candidates,
+        timeout=args.quick_timeout,
+        concurrency=args.quick_concurrency,
+        max_probe=quick_probe_cap,
+    )
+    quick_selected = _select_quick_survivors(quick_rows, quick_keep_cap)
+    merged_candidates = sticky_candidates + quick_selected + sampled + prefilter_candidates
+    candidates = _dedupe_resolvers(merged_candidates)[:deep_probe_cap]
+    if not candidates:
+        raise RuntimeError("no resolvers available after quick-phase selection")
+
     sem = asyncio.Semaphore(max(1, args.concurrency))
 
     async def _run(ip: str) -> ScanRow:
@@ -432,6 +555,17 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "sample_mode": args.sample_mode,
             "sample_cursor": new_cursor,
             "sticky_rows": args.sticky_rows,
+            "prefilter_keep": prefilter_cap,
+            "prefilter_count": len(prefilter_candidates),
+            "prefilter_history_rows": args.prefilter_history_rows,
+            "quick_timeout": args.quick_timeout,
+            "quick_concurrency": args.quick_concurrency,
+            "quick_max_probe": quick_probe_cap,
+            "quick_scanned": len(quick_rows),
+            "quick_working": sum(1 for row in quick_rows if row.ok),
+            "quick_selected": len(quick_selected),
+            "quick_keep": quick_keep_cap,
+            "deep_probe_cap": deep_probe_cap,
             "global_pass_rate_avg": round(
                 statistics.mean([row.pass_rate for row in rows]) if rows else 0.0,
                 4,
@@ -484,6 +618,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=1.5)
     parser.add_argument("--concurrency", type=int, default=40)
     parser.add_argument("--max-probe", type=int, default=400)
+    parser.add_argument("--prefilter-keep", type=int, default=0, help="prefilter cap, <=0 means auto")
+    parser.add_argument("--prefilter-history-rows", type=int, default=128)
+    parser.add_argument("--quick-timeout", type=float, default=1.0)
+    parser.add_argument("--quick-concurrency", type=int, default=100)
+    parser.add_argument("--quick-max-probe", type=int, default=0, help="quick phase probe cap, <=0 means auto")
+    parser.add_argument("--quick-keep", type=int, default=0, help="quick phase survivors cap, <=0 uses --max-probe")
     parser.add_argument("--sample-mode", choices=["head", "random", "sequential"], default="sequential")
     parser.add_argument("--sticky-rows", type=int, default=64)
     parser.add_argument("--sticky-pools", default="active,standby")
