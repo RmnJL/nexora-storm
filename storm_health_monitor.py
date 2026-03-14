@@ -164,9 +164,9 @@ def evaluate_health(stats: dict[str, Any], success_threshold: float, latency_thr
     return True, "ok"
 
 
-def run_restart_cmd(cmdline: str) -> tuple[bool, str]:
+def run_cmdline(cmdline: str) -> tuple[bool, str]:
     if not cmdline.strip():
-        return False, "empty restart cmd"
+        return False, "empty cmd"
     try:
         cmd = shlex.split(cmdline)
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -177,6 +177,10 @@ def run_restart_cmd(cmdline: str) -> tuple[bool, str]:
         return ok, detail
     except Exception as exc:
         return False, str(exc)
+
+
+def run_restart_cmd(cmdline: str) -> tuple[bool, str]:
+    return run_cmdline(cmdline)
 
 
 def apply_failover_rotation(active_file: str, healthy_file: str, take: int) -> tuple[bool, list[str]]:
@@ -245,6 +249,10 @@ async def run_loop(args: argparse.Namespace) -> int:
             "restart_ok": False,
             "restart_detail": "",
             "selected": [],
+            "rank_attempted": False,
+            "rank_ok": False,
+            "rank_detail": "",
+            "rank_selected": [],
         }
 
         results, stats = await run_probe_batch(args)
@@ -263,14 +271,35 @@ async def run_loop(args: argparse.Namespace) -> int:
         if not healthy and state.fail_streak >= args.fail_streak_trigger:
             if (now - state.last_action_ts) >= args.action_cooldown:
                 action["triggered"] = True
+                rank_eligible = (
+                    bool(args.e2e_rank_cmd.strip())
+                    and state.fail_streak >= max(1, int(args.e2e_rank_min_fail_streak))
+                )
+                if rank_eligible:
+                    action["rank_attempted"] = True
+                    rank_ok, rank_detail = run_cmdline(args.e2e_rank_cmd)
+                    action["rank_ok"] = rank_ok
+                    action["rank_detail"] = rank_detail
+                    action["rank_selected"] = load_resolver_file(args.active_file)[: max(1, int(args.take))]
+                    if action["rank_ok"] and not action["rank_selected"]:
+                        action["rank_ok"] = False
+                        action["rank_detail"] = (
+                            f"{rank_detail}; no resolvers written to active file"
+                            if rank_detail
+                            else "no resolvers written to active file"
+                        )
+                    action["selected"] = action["rank_selected"]
+
                 if bool(args.failover_rotate):
-                    rotated, selected = apply_failover_rotation(
-                        active_file=args.active_file,
-                        healthy_file=args.healthy_file,
-                        take=args.take,
-                    )
-                    action["rotated"] = rotated
-                    action["selected"] = selected
+                    # If e2e ranking failed, fall back to simple healthy-list rotation.
+                    if not action["rank_ok"]:
+                        rotated, selected = apply_failover_rotation(
+                            active_file=args.active_file,
+                            healthy_file=args.healthy_file,
+                            take=args.take,
+                        )
+                        action["rotated"] = rotated
+                        action["selected"] = selected
 
                 restart_ok, restart_detail = run_restart_cmd(args.failover_restart_cmd)
                 action["restart_ok"] = restart_ok
@@ -345,6 +374,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-cooldown", type=float, default=180.0)
     parser.add_argument("--failover-rotate", type=int, default=1)
     parser.add_argument("--failover-restart-cmd", default="systemctl restart storm-client")
+    parser.add_argument("--e2e-rank-min-fail-streak", type=int, default=6)
+    parser.add_argument("--e2e-rank-cmd", default="")
 
     parser.add_argument("--state-json", default="state/health_monitor_state.json")
     parser.add_argument("--report-json", default="state/health_monitor_report.json")
