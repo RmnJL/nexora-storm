@@ -23,6 +23,7 @@ UNIT_NAME_BY_SERVICE = {
     "storm-client": "storm-client.service",
     "storm-resolver-scanner": "storm-resolver-scanner.service",
     "storm-resolver-daemon": "storm-resolver-daemon.service",
+    "storm-health-monitor": "storm-health-monitor.service",
     "storm-server": "storm-server.service",
 }
 
@@ -70,7 +71,7 @@ def patch_service_env_var(text: str, key: str, value: str) -> tuple[str, bool]:
 
 def services_for_role(role: str) -> list[str]:
     if role == "inside":
-        return ["storm-resolver-scanner", "storm-resolver-daemon", "storm-client"]
+        return ["storm-resolver-scanner", "storm-resolver-daemon", "storm-client", "storm-health-monitor"]
     if role == "outside":
         return ["storm-server"]
     raise ValueError(f"unsupported role: {role}")
@@ -84,11 +85,13 @@ def required_paths(base_dir: Path, role: str) -> list[Path]:
             base_dir / "storm_resolver_picker.py",
             base_dir / "storm_resolver_daemon.py",
             base_dir / "storm_resolver_scanner.py",
+            base_dir / "storm_health_monitor.py",
             base_dir / "run_storm_client_auto.sh",
             base_dir / "data" / "resolvers.txt",
             base_dir / "systemd" / "storm-client.service",
             base_dir / "systemd" / "storm-resolver-scanner.service",
             base_dir / "systemd" / "storm-resolver-daemon.service",
+            base_dir / "systemd" / "storm-health-monitor.service",
         ]
     if role == "outside":
         return common + [
@@ -186,6 +189,12 @@ def expected_exec_tokens(service: str, zone: str, base_dir: str) -> list[str]:
             f"{base_dir}/storm_server.py",
             f"--zone {zone}",
             "--listen 0.0.0.0:53",
+        ]
+    if service == "storm-health-monitor":
+        return [
+            f"{base_dir}/storm_health_monitor.py",
+            "--proxy-port 1443",
+            "--loop 30",
         ]
     return []
 

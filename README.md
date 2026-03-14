@@ -147,6 +147,7 @@ Operational runbook:
 
 Active probe tool:
 - `storm_health_check.py`
+- `storm_health_monitor.py` (continuous health monitor + auto failover action)
 - `storm_resolver_picker.py` (selects healthy resolvers from `data/resolvers.txt`)
 - `storm_resolver_daemon.py` (keeps active resolver set fresh in background)
 - `storm_resolver_scanner.py` (builds active/standby/quarantine pools with rollback-safe publish)
@@ -196,6 +197,7 @@ Use provided systemd units:
 - `systemd/storm-client.service`
 - `systemd/storm-resolver-scanner.service` (inside quality scanner sidecar)
 - `systemd/storm-resolver-daemon.service` (inside resolver manager)
+- `systemd/storm-health-monitor.service` (inside health watchdog + failover trigger)
 
 Recommended (auto-sync + validation):
 ```bash
@@ -228,6 +230,7 @@ cat /opt/nexora-storm/state/resolvers_scan.json
 cat /opt/nexora-storm/state/resolvers_active.txt
 cat /opt/nexora-storm/state/resolvers_healthy.txt
 cat /opt/nexora-storm/state/resolver_daemon_state.json
+cat /opt/nexora-storm/state/health_monitor_report.json
 ```
 
 Notes:
@@ -235,7 +238,8 @@ Notes:
 - The daemon auto-scans a random subset of a large resolver pool each cycle.
 - No manual `/tmp/probe_*.json` loop is required.
 - `storm-client` reads `resolvers_active.txt` and restarts only when active set changes (with cooldown).
-- `storm-server` service exists only on outside; inside should run `storm-resolver-scanner` + `storm-resolver-daemon` + `storm-client`.
+- `storm-health-monitor` runs periodic SOCKS probes and can auto-rotate active resolvers + restart `storm-client` on repeated health failures.
+- `storm-server` service exists only on outside; inside should run `storm-resolver-scanner` + `storm-resolver-daemon` + `storm-client` + `storm-health-monitor`.
 
 ## Testing
 

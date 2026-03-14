@@ -9,6 +9,9 @@ WorkingDirectory=/opt/nexora-storm
 Environment=STORM_ZONE=t1.phonexpress.ir
 Environment=STORM_BOOTSTRAP_ALLOW_FALLBACK=0
 Environment=STORM_PICKER_SAMPLE_MODE=random
+Environment=STORM_RESOLVER_TAKE=8
+Environment=STORM_RESOLVER_MIN_SELECTED=4
+Environment=STORM_RESOLVER_MAX_SELECTED=8
 Environment=STORM_RESOLVER_MAX_PROBE=300
 Environment=STORM_RESOLVER_CONCURRENCY=60
 ExecStart=/opt/nexora-storm/run_storm_client_auto.sh
