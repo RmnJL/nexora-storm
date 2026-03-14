@@ -4,6 +4,7 @@ from storm_health_monitor import (
     build_failover_selection,
     evaluate_health,
     parse_resolver_tokens,
+    parse_target_tokens,
 )
 
 
@@ -39,3 +40,8 @@ def test_evaluate_health_fails_for_low_success_and_high_latency():
     assert ok is False
     assert "success_rate=" in reason
     assert "p95=" in reason
+
+
+def test_parse_target_tokens_accepts_host_and_host_port():
+    targets = parse_target_tokens("1.1.1.1:443 8.8.8.8 example.com", default_port=8443)
+    assert targets == [("1.1.1.1", 443), ("8.8.8.8", 8443), ("example.com", 8443)]

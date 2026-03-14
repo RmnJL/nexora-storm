@@ -9,12 +9,29 @@ from __future__ import annotations
 import asyncio
 import base64
 import socket
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import dns.message
 import dns.name
 import dns.rdataclass
+import dns.rcode
 import dns.resolver
+
+
+@dataclass(frozen=True)
+class DNSQueryResult:
+    resolver: str
+    response_packet: Optional[bytes]
+    latency_ms: float
+    error_class: str = ""
+    error_detail: str = ""
+    rcode: int = -1
+    attempted_resolvers: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.response_packet is not None
 
 
 class DNSTransport:
@@ -71,6 +88,22 @@ class DNSTransport:
         Send DNS query with packet.
         Returns (response_packet, latency_ms) or (None, latency_ms) on timeout.
         """
+        result = await self.send_query_detailed(
+            packet=packet,
+            resolver_ip=resolver_ip,
+            session_id=session_id,
+            timeout=timeout,
+        )
+        return result.response_packet, result.latency_ms
+
+    async def send_query_detailed(
+        self,
+        packet: bytes,
+        resolver_ip: str,
+        session_id: str = "",
+        timeout: float = 3.0,
+    ) -> DNSQueryResult:
+        """Send one query and return a classified result."""
         qname = self.make_query_name(packet, session_id)
         
         start = asyncio.get_event_loop().time()
@@ -94,20 +127,58 @@ class DNSTransport:
                 )
                 
                 elapsed = (asyncio.get_event_loop().time() - start) * 1000
+
+                rcode = int(response.rcode())
+                if rcode != dns.rcode.NOERROR:
+                    return DNSQueryResult(
+                        resolver=resolver_ip,
+                        response_packet=None,
+                        latency_ms=elapsed,
+                        error_class=_rcode_to_error_class(rcode),
+                        error_detail=dns.rcode.to_text(rcode),
+                        rcode=rcode,
+                    )
                 
                 # Extract response data
                 resp_packet = self._extract_response(response)
-                
-                return resp_packet, elapsed
+                if resp_packet is None:
+                    return DNSQueryResult(
+                        resolver=resolver_ip,
+                        response_packet=None,
+                        latency_ms=elapsed,
+                        error_class="empty-answer",
+                        error_detail="no usable TXT payload",
+                        rcode=rcode,
+                    )
+
+                return DNSQueryResult(
+                    resolver=resolver_ip,
+                    response_packet=resp_packet,
+                    latency_ms=elapsed,
+                    error_class="",
+                    error_detail="",
+                    rcode=rcode,
+                )
             
             except asyncio.TimeoutError:
                 elapsed = (asyncio.get_event_loop().time() - start) * 1000
-                return None, elapsed
+                return DNSQueryResult(
+                    resolver=resolver_ip,
+                    response_packet=None,
+                    latency_ms=elapsed,
+                    error_class="timeout",
+                    error_detail="query timeout",
+                )
         
         except Exception as e:
             elapsed = (asyncio.get_event_loop().time() - start) * 1000
-            print(f"DNS query error: {e}")
-            return None, elapsed
+            return DNSQueryResult(
+                resolver=resolver_ip,
+                response_packet=None,
+                latency_ms=elapsed,
+                error_class="query-error",
+                error_detail=str(e),
+            )
     
     async def _dns_query_async(self, query: dns.message.Message, resolver_ip: str) -> dns.message.Message:
         """Send DNS query asynchronously"""
@@ -168,45 +239,94 @@ class DNSGateway:
         packet: bytes,
         session_id: str = "",
         timeout: float = 3.0,
+        resolver_order: Optional[list[str]] = None,
+        fanout: int = 0,
     ) -> Tuple[Optional[bytes], str, float]:
         """
         Send query to any available resolver (parallel).
         Returns (response, used_resolver, latency_ms).
         """
-        if not self.resolvers:
-            return None, "", 0.0
-        
-        task_map = {
-            asyncio.create_task(
-                self.transport.send_query(packet, resolver, session_id, timeout)
-            ): resolver
-            for resolver in self.resolvers
-        }
-        pending = set(task_map.keys())
-        last_resolver = self.resolvers[0]
-        last_latency = 0.0
-        
-        # Race: return first successful response
-        while pending:
-            done, pending = await asyncio.wait(
-                pending,
-                return_when=asyncio.FIRST_COMPLETED,
+        result = await self.send_to_any_detailed(
+            packet=packet,
+            session_id=session_id,
+            timeout=timeout,
+            resolver_order=resolver_order,
+            fanout=fanout,
+        )
+        return result.response_packet, result.resolver, result.latency_ms
+
+    async def send_to_any_detailed(
+        self,
+        packet: bytes,
+        session_id: str = "",
+        timeout: float = 3.0,
+        resolver_order: Optional[list[str]] = None,
+        fanout: int = 0,
+    ) -> DNSQueryResult:
+        ordered = _ordered_dedupe(resolver_order if resolver_order else self.resolvers)
+        if not ordered:
+            return DNSQueryResult(
+                resolver="",
+                response_packet=None,
+                latency_ms=0.0,
+                error_class="no-resolvers",
+                error_detail="resolver list is empty",
             )
-            
-            for task in done:
-                resolver = task_map[task]
-                resp, latency = task.result()
-                last_resolver = resolver
-                last_latency = latency
-                
-                if resp is not None:
-                    # Cancel pending
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    return resp, resolver, latency
-        
-        return None, last_resolver, last_latency
+
+        batch_size = len(ordered) if int(fanout) <= 0 else min(max(1, int(fanout)), len(ordered))
+        attempted: list[str] = []
+        failures: list[DNSQueryResult] = []
+
+        for start in range(0, len(ordered), batch_size):
+            batch = ordered[start : start + batch_size]
+            attempted.extend(batch)
+            task_map = {
+                asyncio.create_task(
+                    self.transport.send_query_detailed(
+                        packet=packet,
+                        resolver_ip=resolver,
+                        session_id=session_id,
+                        timeout=timeout,
+                    )
+                ): resolver
+                for resolver in batch
+            }
+            pending = set(task_map.keys())
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    result = task.result()
+                    if result.ok:
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return DNSQueryResult(
+                            resolver=result.resolver,
+                            response_packet=result.response_packet,
+                            latency_ms=result.latency_ms,
+                            error_class=result.error_class,
+                            error_detail=result.error_detail,
+                            rcode=result.rcode,
+                            attempted_resolvers=tuple(attempted),
+                        )
+                    failures.append(result)
+
+            # Move to next batch if this batch fully failed.
+
+        best = _pick_best_failure(failures)
+        return DNSQueryResult(
+            resolver=best.resolver if best else ordered[0],
+            response_packet=None,
+            latency_ms=best.latency_ms if best else timeout * 1000.0,
+            error_class=best.error_class if best else "no-response",
+            error_detail=best.error_detail if best else "all resolvers failed",
+            rcode=best.rcode if best else -1,
+            attempted_resolvers=tuple(attempted),
+        )
     
     async def send_to_specific(
         self,
@@ -217,3 +337,46 @@ class DNSGateway:
     ) -> Tuple[Optional[bytes], float]:
         """Send query to specific resolver"""
         return await self.transport.send_query(packet, resolver, session_id, timeout)
+
+
+def _ordered_dedupe(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        resolver = str(raw).strip()
+        if not resolver or resolver in seen:
+            continue
+        seen.add(resolver)
+        out.append(resolver)
+    return out
+
+
+def _rcode_to_error_class(rcode: int) -> str:
+    if rcode == dns.rcode.NXDOMAIN:
+        return "nxdomain"
+    if rcode == dns.rcode.SERVFAIL:
+        return "servfail"
+    if rcode == dns.rcode.REFUSED:
+        return "refused"
+    return "dns-error"
+
+
+def _pick_best_failure(results: list[DNSQueryResult]) -> Optional[DNSQueryResult]:
+    if not results:
+        return None
+    # Prefer explicit DNS/protocol failures over generic timeout when selecting reason.
+    priority = {
+        "conn-id-mismatch": 0,
+        "empty-answer": 1,
+        "nxdomain": 1,
+        "servfail": 2,
+        "refused": 2,
+        "dns-error": 3,
+        "query-error": 4,
+        "timeout": 5,
+        "no-response": 5,
+    }
+    return min(
+        results,
+        key=lambda r: (priority.get(r.error_class, 6), r.latency_ms),
+    )

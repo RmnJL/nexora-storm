@@ -308,6 +308,7 @@ class ResolverDaemon:
         changed = False
         restarted = False
         restart_reason = ""
+        forced_floor = False
 
         if eligible:
             stabilized = stabilize_selection(previous, selected, self.args.take)
@@ -329,6 +330,21 @@ class ResolverDaemon:
                 self.args.min_healthy,
                 self.args.allow_fallback,
             )
+            floor_take = max(1, min(self.args.take, self.args.min_active_floor))
+            floor_basis = previous if previous else rank_resolvers(results, floor_take)
+            floor_selected = stabilize_selection(previous, floor_basis, floor_take)
+            if floor_selected:
+                forced_floor = True
+                changed = floor_selected != previous
+                atomic_write_text(self.args.active_out, format_active_resolvers(floor_selected))
+                now = time.time()
+                if changed and self.args.restart_on_change:
+                    if should_restart(self.last_restart_at, now, self.args.restart_cooldown):
+                        restarted, restart_reason = self._restart_client()
+                        if restarted:
+                            self.last_restart_at = now
+                    else:
+                        restart_reason = "cooldown"
 
         state = {
             "timestamp": time.time(),
@@ -344,6 +360,7 @@ class ResolverDaemon:
             "active": load_active_resolvers(self.args.active_out),
             "healthy_ranked": healthy_ranked,
             "changed": changed,
+            "forced_floor": forced_floor,
             "restarted": restarted,
             "restart_reason": restart_reason,
             "results": [asdict(r) for r in results],
@@ -417,6 +434,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sticky-keep", type=int, default=4)
     parser.add_argument("--take", type=int, default=4)
     parser.add_argument("--min-healthy", type=int, default=2)
+    parser.add_argument("--min-active-floor", type=int, default=4, help="keep at least this many active resolvers when health is below threshold")
     parser.add_argument("--allow-fallback", action="store_true")
     parser.add_argument("--healthy-out", default="state/resolvers_healthy.txt")
     parser.add_argument("--healthy-out-max", type=int, default=256)

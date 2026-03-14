@@ -6,6 +6,8 @@ PYTHON_BIN="${BASE_DIR}/.venv/bin/python"
 ZONE="${STORM_ZONE:-t1.phonexpress.ir}"
 LISTEN_ADDR="${STORM_LISTEN:-127.0.0.1:1443}"
 POLL_INTERVAL="${STORM_POLL_INTERVAL:-0.2}"
+DNS_TIMEOUT="${STORM_DNS_TIMEOUT:-3.0}"
+RESOLVER_FANOUT="${STORM_RESOLVER_FANOUT:-3}"
 RESOLVER_FILE="${STORM_RESOLVER_FILE:-${BASE_DIR}/data/resolvers.txt}"
 RESOLVER_TAKE="${STORM_RESOLVER_TAKE:-8}"
 RESOLVER_MIN_SELECTED="${STORM_RESOLVER_MIN_SELECTED:-4}"
@@ -94,4 +96,6 @@ exec "${PYTHON_BIN}" "${BASE_DIR}/storm_client.py" \
   --listen "${LISTEN_ADDR}" \
   --zone "${ZONE}" \
   --poll-interval "${POLL_INTERVAL}" \
+  --dns-timeout "${DNS_TIMEOUT}" \
+  --resolver-fanout "${RESOLVER_FANOUT}" \
   --resolvers ${SELECTED}

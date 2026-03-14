@@ -357,6 +357,34 @@ async def _probe_once(
     transport: DNSTransport,
     resolver: str,
     timeout: float,
+    protocol_roundtrips: int = 1,
+) -> tuple[bool, float, str]:
+    rounds = max(1, int(protocol_roundtrips))
+    latency_samples: list[float] = []
+    error = ""
+
+    for _ in range(rounds):
+        ok, latency_ms, err = await _probe_protocol_session(
+            transport=transport,
+            resolver=resolver,
+            timeout=timeout,
+            extra_keepalive=rounds > 1,
+        )
+        if not ok:
+            return False, latency_ms, err
+        latency_samples.append(latency_ms)
+        if err:
+            error = err
+
+    latency = float(statistics.median(latency_samples)) if latency_samples else timeout * 1000.0
+    return True, latency, error
+
+
+async def _probe_protocol_session(
+    transport: DNSTransport,
+    resolver: str,
+    timeout: float,
+    extra_keepalive: bool,
 ) -> tuple[bool, float, str]:
     conn_id = secrets.token_bytes(4)
     packet = make_packet(
@@ -366,18 +394,43 @@ async def _probe_once(
         payload=b"",
     )
     try:
-        resp, latency = await transport.send_query(
+        result = await transport.send_query_detailed(
             packet=packet,
             resolver_ip=resolver,
             session_id="scan",
             timeout=timeout,
         )
-        if resp is None:
-            return False, latency, "no-response"
-        header, _ = parse_packet(resp)
+        if result.response_packet is None:
+            err = result.error_class or result.error_detail or "no-response"
+            return False, result.latency_ms, err
+
+        header, _ = parse_packet(result.response_packet)
         if header.conn_id != conn_id:
-            return False, latency, "conn-id-mismatch"
-        return True, latency, ""
+            return False, result.latency_ms, "conn-id-mismatch"
+
+        latencies = [result.latency_ms]
+        if extra_keepalive:
+            packet2 = make_packet(
+                conn_id=conn_id,
+                flags=PacketFlags.KEEPALIVE,
+                seq_offset=1,
+                payload=b"",
+            )
+            result2 = await transport.send_query_detailed(
+                packet=packet2,
+                resolver_ip=resolver,
+                session_id="scan",
+                timeout=timeout,
+            )
+            if result2.response_packet is None:
+                err = result2.error_class or result2.error_detail or "no-response"
+                return False, result2.latency_ms, err
+            header2, _ = parse_packet(result2.response_packet)
+            if header2.conn_id != conn_id:
+                return False, result2.latency_ms, "conn-id-mismatch"
+            latencies.append(result2.latency_ms)
+
+        return True, float(statistics.median(latencies)), ""
     except Exception as exc:
         return False, timeout * 1000.0, str(exc)
 
@@ -388,6 +441,7 @@ async def _probe_resolver(
     timeout: float,
     rounds: int,
     min_success: int,
+    protocol_roundtrips: int,
 ) -> ScanRow:
     probes = max(1, int(rounds))
     need = max(1, min(int(min_success), probes))
@@ -396,7 +450,12 @@ async def _probe_resolver(
     error = ""
 
     for idx in range(probes):
-        ok, latency_ms, err = await _probe_once(transport, resolver, timeout)
+        ok, latency_ms, err = await _probe_once(
+            transport=transport,
+            resolver=resolver,
+            timeout=timeout,
+            protocol_roundtrips=protocol_roundtrips,
+        )
         if ok:
             successes += 1
             latency_samples.append(latency_ms)
@@ -496,6 +555,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
                 timeout=args.timeout,
                 rounds=args.rounds,
                 min_success=args.min_success,
+                protocol_roundtrips=args.protocol_roundtrips if bool(args.deep_protocol_check) else 1,
             )
 
     tasks = [asyncio.create_task(_run(ip)) for ip in candidates]
@@ -570,6 +630,8 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
                 statistics.mean([row.pass_rate for row in rows]) if rows else 0.0,
                 4,
             ),
+            "deep_protocol_check": bool(args.deep_protocol_check),
+            "protocol_roundtrips": int(args.protocol_roundtrips),
         },
         "pools": {
             "active": active,
@@ -629,6 +691,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sticky-pools", default="active,standby")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--min-success", type=int, default=1)
+    parser.add_argument("--deep-protocol-check", type=int, default=1, help="use session-style protocol probe in deep phase")
+    parser.add_argument("--protocol-roundtrips", type=int, default=2, help="per-round protocol roundtrips in deep phase")
     parser.add_argument("--active-pool-size", type=int, default=12)
     parser.add_argument("--standby-pool-size", type=int, default=64)
     parser.add_argument("--publish-min-pass-rate", type=float, default=0.55)

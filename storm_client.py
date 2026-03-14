@@ -29,12 +29,16 @@ class STORMClient:
         zone: str = "t1.phonexpress.ir",
         qtype: str = "TXT",
         poll_interval: float = 0.2,
+        dns_timeout: float = 3.0,
+        resolver_fanout: int = 3,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.zone = zone
         self.qtype = qtype
         self.poll_interval = max(0.05, poll_interval)
+        self.dns_timeout = max(0.5, float(dns_timeout))
+        self.resolver_fanout = max(1, int(resolver_fanout))
         
         # Resolver management
         self.resolver_selector = ResolverSelector(resolvers)
@@ -227,28 +231,54 @@ class STORMClient:
         tx_lock: asyncio.Lock,
     ) -> None:
         """Send one packet over DNS and feed response back into connection state."""
-        primary, _ = self.resolver_selector.select_pair()
-        
         async with tx_lock:
             try:
-                # Try all resolvers in parallel and take first valid answer.
-                resp, resolver, latency = await self.dns_gateway.send_to_any(
+                ordered = self.resolver_selector.rank_candidates()
+                fanout = min(self.resolver_fanout, max(1, len(ordered)))
+                result = await self.dns_gateway.send_to_any_detailed(
                     packet,
                     session_id=storm_conn.conn_id_hex(),
+                    timeout=self.dns_timeout,
+                    resolver_order=ordered,
+                    fanout=fanout,
                 )
                 
-                if resp is not None:
-                    self.resolver_selector.report_success(resolver, latency)
-                    log.debug(f"DNS query ok: {resolver} ({latency:.1f}ms)")
-                    await storm_conn.handle_incoming_packet(resp)
+                if result.response_packet is not None:
+                    self.resolver_selector.report_success(result.resolver, result.latency_ms)
+                    log.debug(
+                        "DNS query ok: resolver=%s fanout=%d latency=%.1fms",
+                        result.resolver,
+                        fanout,
+                        result.latency_ms,
+                    )
+                    await storm_conn.handle_incoming_packet(result.response_packet)
                     return
                 
-                self.resolver_selector.report_failure(resolver, is_timeout=True)
-                log.debug(f"DNS query timeout: {resolver}")
+                is_timeout = result.error_class in {"timeout", "no-response"}
+                attempted = list(result.attempted_resolvers) if result.attempted_resolvers else [result.resolver]
+                for resolver in attempted:
+                    self.resolver_selector.report_failure(
+                        resolver,
+                        is_timeout=is_timeout,
+                        latency_ms=result.latency_ms,
+                        reason=result.error_class,
+                    )
+                log.debug(
+                    "DNS query failed: reason=%s resolver=%s attempted=%s detail=%s",
+                    result.error_class,
+                    result.resolver,
+                    ",".join(attempted),
+                    result.error_detail,
+                )
             
             except Exception as e:
                 log.error(f"DNS transmission error: {e}")
-                self.resolver_selector.report_failure(primary, is_timeout=False)
+                primary = self.resolver_selector.select_primary()
+                self.resolver_selector.report_failure(
+                    primary,
+                    is_timeout=False,
+                    reason="client-exception",
+                )
 
 
 async def main():
@@ -269,6 +299,18 @@ async def main():
         default=0.2,
         help="Idle poll interval in seconds for DNS keepalive queries",
     )
+    parser.add_argument(
+        "--dns-timeout",
+        type=float,
+        default=3.0,
+        help="Per-query DNS timeout in seconds",
+    )
+    parser.add_argument(
+        "--resolver-fanout",
+        type=int,
+        default=3,
+        help="How many resolvers to query in parallel per retry window",
+    )
     args = parser.parse_args()
     
     listen_host, listen_port = args.listen.rsplit(":", 1)
@@ -286,6 +328,8 @@ async def main():
         zone=args.zone,
         qtype=args.qtype,
         poll_interval=args.poll_interval,
+        dns_timeout=args.dns_timeout,
+        resolver_fanout=args.resolver_fanout,
     )
     
     try:

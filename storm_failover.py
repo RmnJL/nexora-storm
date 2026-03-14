@@ -24,6 +24,9 @@ class ResolverHealth:
     blacklist_until: float = 0.0
     latency_ms_ewma: float = 700.0  # Exponential weighted moving average
     success_ewma: float = 0.5  # Success rate EWMA
+    timeout_streak: int = 0
+    last_error: str = ""
+    last_error_at: float = 0.0
     
     def success_rate(self) -> float:
         total = self.success_count + self.fail_count
@@ -37,11 +40,15 @@ class ResolverHealth:
         return now < self.blacklist_until
     
     def overall_score(self, now: Optional[float] = None) -> float:
-        """Combined score: success_ewma - blacklist_penalty"""
+        """Combined score favoring stable, fast, non-blacklisted resolvers."""
         if now is None:
             now = time.time()
-        penalty = 1000 if self.is_blacklisted(now) else 0
-        return self.success_ewma - penalty * 0.01
+        penalty = 1000.0 if self.is_blacklisted(now) else 0.0
+        success_component = self.success_ewma * 1000.0
+        latency_component = max(1.0, self.latency_ms_ewma)
+        timeout_penalty = min(300.0, float(self.timeout_streak) * 25.0)
+        fail_penalty = min(240.0, float(self.fail_count) * 2.0)
+        return success_component - latency_component - timeout_penalty - fail_penalty - penalty
 
 
 class ResolverSelector:
@@ -69,21 +76,42 @@ class ResolverSelector:
         }
         self._current_primary = self.resolvers[0]
         self._fail_streak: dict[str, int] = {r: 0 for r in self.resolvers}
+        self._reason_cooldown: dict[str, float] = {
+            "timeout": max(self.blacklist_cooldown, 10.0),
+            "no-response": max(self.blacklist_cooldown, 10.0),
+            "empty-answer": max(self.blacklist_cooldown * 1.2, 12.0),
+            "nxdomain": max(self.blacklist_cooldown * 1.2, 12.0),
+            "servfail": max(self.blacklist_cooldown * 1.1, 10.0),
+            "refused": max(self.blacklist_cooldown * 1.1, 10.0),
+            "conn-id-mismatch": max(self.blacklist_cooldown * 1.5, 15.0),
+            "dns-error": max(self.blacklist_cooldown, 10.0),
+            "query-error": max(self.blacklist_cooldown, 10.0),
+        }
+        self._reason_threshold: dict[str, int] = {
+            "timeout": self.fail_threshold,
+            "no-response": self.fail_threshold,
+            "empty-answer": 2,
+            "nxdomain": 2,
+            "servfail": 2,
+            "refused": 2,
+            "conn-id-mismatch": 1,
+            "dns-error": 2,
+            "query-error": 2,
+        }
+
+    @staticmethod
+    def _normalize_reason(reason: Optional[str], is_timeout: bool) -> str:
+        if is_timeout:
+            return "timeout"
+        normalized = str(reason or "").strip().lower()
+        if not normalized:
+            return "failure"
+        return normalized
     
     def _select_primary_locked(self, now: float) -> str:
         """Select primary while caller holds lock."""
-        candidates = [
-            r for r in self.resolvers
-            if not self._health[r].is_blacklisted(now)
-        ]
-        if not candidates:
-            # All blacklisted, pick least-bad
-            candidates = self.resolvers
-        
-        best = max(
-            candidates,
-            key=lambda r: self._health[r].overall_score(now)
-        )
+        ranked = self._rank_candidates_locked(now)
+        best = ranked[0] if ranked else self.resolvers[0]
         self._current_primary = best
         return best
     
@@ -104,12 +132,34 @@ class ResolverSelector:
             primary = self._select_primary_locked(now)
             
             # Secondary: next best, different from primary
-            secondary = next(
-                (r for r in self.resolvers if r != primary),
-                primary,
-            )
+            ranked = self._rank_candidates_locked(now)
+            secondary = next((r for r in ranked if r != primary), primary)
             
             return primary, secondary
+
+    def rank_candidates(self, limit: Optional[int] = None) -> list[str]:
+        """Return resolvers ordered by health score with blacklisted resolvers at the end."""
+        now = time.time()
+        with self._lock:
+            ordered = self._rank_candidates_locked(now)
+            if limit is None:
+                return ordered
+            return ordered[: max(1, int(limit))]
+
+    def _rank_candidates_locked(self, now: float) -> list[str]:
+        healthy = [r for r in self.resolvers if not self._health[r].is_blacklisted(now)]
+        blocked = [r for r in self.resolvers if r not in healthy]
+        healthy_sorted = sorted(
+            healthy,
+            key=lambda r: self._health[r].overall_score(now),
+            reverse=True,
+        )
+        blocked_sorted = sorted(
+            blocked,
+            key=lambda r: self._health[r].overall_score(now),
+            reverse=True,
+        )
+        return healthy_sorted + blocked_sorted
     
     def report_success(self, resolver: str, latency_ms: float) -> None:
         """Report successful query"""
@@ -122,6 +172,8 @@ class ResolverSelector:
             h.success_count += 1
             h.last_success_at = now
             h.blacklist_until = 0.0
+            h.timeout_streak = 0
+            h.last_error = ""
             self._fail_streak[resolver] = 0
             
             # Update EWMA
@@ -139,6 +191,7 @@ class ResolverSelector:
         resolver: str,
         is_timeout: bool = False,
         latency_ms: Optional[float] = None,
+        reason: Optional[str] = None,
     ) -> None:
         """Report failed query"""
         now = time.time()
@@ -149,9 +202,18 @@ class ResolverSelector:
             h = self._health[resolver]
             h.fail_count += 1
             h.last_fail_at = now
+            fail_reason = self._normalize_reason(reason, is_timeout)
+            h.last_error = fail_reason
+            h.last_error_at = now
             
             if is_timeout:
                 h.timeout_count += 1
+                h.timeout_streak += 1
+            elif fail_reason in {"timeout", "no-response"}:
+                h.timeout_count += 1
+                h.timeout_streak += 1
+            else:
+                h.timeout_streak = 0
             
             # Update EWMA
             h.success_ewma = (
@@ -168,8 +230,10 @@ class ResolverSelector:
             self._fail_streak[resolver] = self._fail_streak.get(resolver, 0) + 1
             
             # Blacklist on threshold
-            if self._fail_streak[resolver] >= self.fail_threshold:
-                h.blacklist_until = now + self.blacklist_cooldown
+            threshold = self._reason_threshold.get(fail_reason, self.fail_threshold)
+            cooldown = self._reason_cooldown.get(fail_reason, self.blacklist_cooldown)
+            if self._fail_streak[resolver] >= max(1, threshold):
+                h.blacklist_until = max(h.blacklist_until, now + cooldown)
                 self._fail_streak[resolver] = 0
     
     def get_health(self, resolver: Optional[str] = None) -> dict:
@@ -184,11 +248,14 @@ class ResolverSelector:
                     "success_count": h.success_count,
                     "fail_count": h.fail_count,
                     "timeout_count": h.timeout_count,
+                    "timeout_streak": h.timeout_streak,
                     "success_rate": h.success_rate(),
                     "success_ewma": round(h.success_ewma, 4),
                     "latency_ms_ewma": round(h.latency_ms_ewma, 2),
                     "blacklisted": h.is_blacklisted(),
                     "blacklist_until": h.blacklist_until,
+                    "last_error": h.last_error,
+                    "overall_score": round(h.overall_score(), 2),
                 }
             else:
                 return {
@@ -197,10 +264,13 @@ class ResolverSelector:
                         "success_count": self._health[r].success_count,
                         "fail_count": self._health[r].fail_count,
                         "timeout_count": self._health[r].timeout_count,
+                        "timeout_streak": self._health[r].timeout_streak,
                         "success_rate": self._health[r].success_rate(),
                         "success_ewma": round(self._health[r].success_ewma, 4),
                         "latency_ms_ewma": round(self._health[r].latency_ms_ewma, 2),
                         "blacklisted": self._health[r].is_blacklisted(),
+                        "last_error": self._health[r].last_error,
+                        "overall_score": round(self._health[r].overall_score(), 2),
                     }
                     for r in self.resolvers
                 }

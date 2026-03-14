@@ -44,10 +44,46 @@ def parse_resolver_tokens(text: str) -> list[str]:
     return out
 
 
+def parse_target_tokens(text: str, default_port: int) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for token in text.replace("\n", " ").split(" "):
+        raw = token.strip()
+        if not raw:
+            continue
+        host, port = _parse_target_endpoint(raw, default_port)
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _parse_target_endpoint(raw: str, default_port: int) -> tuple[str, int]:
+    if ":" in raw:
+        host, _, port_raw = raw.rpartition(":")
+        host = host.strip()
+        try:
+            port = int(port_raw.strip())
+        except ValueError:
+            port = int(default_port)
+        return host, max(1, min(65535, port))
+    return raw.strip(), max(1, min(65535, int(default_port)))
+
+
 def load_resolver_file(path: str) -> list[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return parse_resolver_tokens(f.read())
+    except FileNotFoundError:
+        return []
+
+
+def load_target_file(path: str, default_port: int) -> list[tuple[str, int]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return parse_target_tokens(f.read(), default_port=default_port)
     except FileNotFoundError:
         return []
 
@@ -157,18 +193,45 @@ def apply_failover_rotation(active_file: str, healthy_file: str, take: int) -> t
 
 async def run_probe_batch(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[str, Any]]:
     results: list[ProbeResult] = []
+    targets = _build_targets(args)
+    target_log: list[str] = []
     for idx in range(args.checks):
+        host, port = targets[idx % len(targets)]
         result = await run_socks5_probe(
             proxy_host=args.proxy_host,
             proxy_port=args.proxy_port,
-            target_host=args.target_host,
-            target_port=args.target_port,
+            target_host=host,
+            target_port=port,
             timeout=args.timeout,
         )
         results.append(result)
+        target_log.append(f"{host}:{port}")
         if idx < args.checks - 1 and args.interval > 0:
             await asyncio.sleep(args.interval)
-    return results, compute_stats(results)
+    stats = compute_stats(results)
+    stats["targets_used"] = sorted(set(target_log))
+    return results, stats
+
+
+def _build_targets(args: argparse.Namespace) -> list[tuple[str, int]]:
+    merged: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+
+    cli_tokens = " ".join(args.targets or [])
+    for item in parse_target_tokens(cli_tokens, default_port=args.target_port):
+        if item not in seen:
+            seen.add(item)
+            merged.append(item)
+
+    if args.targets_file:
+        for item in load_target_file(args.targets_file, default_port=args.target_port):
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+
+    if merged:
+        return merged
+    return [(args.target_host, args.target_port)]
 
 
 async def run_loop(args: argparse.Namespace) -> int:
@@ -220,6 +283,7 @@ async def run_loop(args: argparse.Namespace) -> int:
             "probe": {
                 "proxy": f"{args.proxy_host}:{args.proxy_port}",
                 "target": f"{args.target_host}:{args.target_port}",
+                "targets": [f"{h}:{p}" for h, p in _build_targets(args)],
                 "checks": args.checks,
                 "interval": args.interval,
                 "timeout": args.timeout,
@@ -265,6 +329,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy-port", type=int, default=1443)
     parser.add_argument("--target-host", default="1.1.1.1")
     parser.add_argument("--target-port", type=int, default=443)
+    parser.add_argument("--targets", nargs="*", default=[], help="optional list of target endpoints host[:port] for round-robin probe")
+    parser.add_argument("--targets-file", default="", help="optional file containing target endpoints")
     parser.add_argument("--checks", type=int, default=6)
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--timeout", type=float, default=6.0)
