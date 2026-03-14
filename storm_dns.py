@@ -122,8 +122,8 @@ class DNSTransport:
             # Send query
             try:
                 response = await asyncio.wait_for(
-                    self._dns_query_async(q, resolver_ip),
-                    timeout=timeout,
+                    self._dns_query_async(q, resolver_ip, timeout=timeout),
+                    timeout=max(0.2, timeout + 0.2),
                 )
                 
                 elapsed = (asyncio.get_event_loop().time() - start) * 1000
@@ -180,13 +180,18 @@ class DNSTransport:
                 error_detail=str(e),
             )
     
-    async def _dns_query_async(self, query: dns.message.Message, resolver_ip: str) -> dns.message.Message:
+    async def _dns_query_async(
+        self,
+        query: dns.message.Message,
+        resolver_ip: str,
+        timeout: float = 3.0,
+    ) -> dns.message.Message:
         """Send DNS query asynchronously"""
         loop = asyncio.get_event_loop()
         
         def blocking_query():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(5.0)
+            sock.settimeout(max(0.2, float(timeout)))
             try:
                 sock.sendto(query.to_wire(), (resolver_ip, 53))
                 response_wire, _ = sock.recvfrom(4096)
