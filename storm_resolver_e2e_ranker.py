@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import asdict, dataclass
+import ipaddress
 import json
 import os
 import shlex
@@ -31,6 +32,12 @@ def parse_resolver_tokens(text: str) -> list[str]:
     for token in text.replace("\n", " ").split(" "):
         ip = token.strip()
         if not ip or ip in seen:
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.version != 4 or not addr.is_global:
             continue
         seen.add(ip)
         out.append(ip)
@@ -89,11 +96,14 @@ def atomic_write_text(path: str, content: str) -> None:
 
 
 def run_cmd(cmdline: str) -> tuple[bool, str]:
-    if not cmdline.strip():
+    raw = str(cmdline or "").strip()
+    if not raw:
         return False, "empty cmd"
+    if raw in {"-", "none", "None", "off", "OFF"}:
+        return True, "skipped"
     try:
         proc = subprocess.run(
-            shlex.split(cmdline),
+            shlex.split(raw),
             capture_output=True,
             text=True,
             check=False,
@@ -136,6 +146,8 @@ async def probe_resolver(args: argparse.Namespace, resolver: str) -> ResolverRan
         await asyncio.sleep(args.settle_sec)
 
     results: list[ProbeResult] = []
+    fail_cutoff = max(1, int(args.early_fail_cutoff))
+    consecutive_fail = 0
     for idx in range(args.checks_per_resolver):
         result = await run_socks5_probe(
             proxy_host=args.proxy_host,
@@ -145,6 +157,12 @@ async def probe_resolver(args: argparse.Namespace, resolver: str) -> ResolverRan
             timeout=args.timeout,
         )
         results.append(result)
+        if result.ok:
+            consecutive_fail = 0
+        else:
+            consecutive_fail += 1
+            if consecutive_fail >= fail_cutoff:
+                break
         if idx < args.checks_per_resolver - 1 and args.interval > 0:
             await asyncio.sleep(args.interval)
 
@@ -185,7 +203,27 @@ def collect_candidates(args: argparse.Namespace) -> list[str]:
     merged.extend(load_tokens_file(args.candidates_file))
     merged.extend(load_tokens_file(args.fallback_file))
     merged.extend(load_scanner_candidates(args.scanner_json, args.scanner_max_items))
-    return parse_resolver_tokens(" ".join(merged))[: max(1, int(args.max_candidates))]
+    candidates = parse_resolver_tokens(" ".join(merged))
+    return _limit_per_prefix24(candidates, max_per_prefix24=args.max_per_prefix24)[: max(1, int(args.max_candidates))]
+
+
+def _limit_per_prefix24(items: list[str], max_per_prefix24: int) -> list[str]:
+    cap = int(max_per_prefix24)
+    if cap <= 0:
+        return items
+    out: list[str] = []
+    counts: dict[str, int] = {}
+    for ip in items:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            continue
+        prefix = ".".join(parts[:3])
+        count = counts.get(prefix, 0)
+        if count >= cap:
+            continue
+        counts[prefix] = count + 1
+        out.append(ip)
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +245,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=8.0)
     p.add_argument("--settle-sec", type=float, default=2.0)
     p.add_argument("--restart-cmd", default="systemctl restart storm-client")
+    p.add_argument("--early-fail-cutoff", type=int, default=2, help="stop probing a resolver after N consecutive fails")
+    p.add_argument("--max-per-prefix24", type=int, default=2, help="max candidates from same /24")
     p.add_argument("--json-out", default="state/resolver_e2e_rank_report.json")
     p.add_argument("--log", action="store_true", help="print per-resolver progress")
     return p.parse_args()

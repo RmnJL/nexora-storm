@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+import ipaddress
 from threading import Lock
 from typing import Optional
 
@@ -98,6 +99,59 @@ class ResolverSelector:
             "dns-error": 2,
             "query-error": 2,
         }
+
+    @staticmethod
+    def _normalize_resolvers(items: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            ip = str(raw).strip()
+            if not ip or ip in seen:
+                continue
+            # Keep strict as public IPv4 for STORM resolver paths.
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if addr.version != 4 or not addr.is_global:
+                continue
+            seen.add(ip)
+            out.append(ip)
+        return out
+
+    def replace_resolvers(self, resolvers: list[str]) -> bool:
+        """
+        Hot-reload resolver set in-place while preserving known health state.
+        Returns True if effective set changed.
+        """
+        normalized = self._normalize_resolvers(resolvers)
+        if not normalized:
+            return False
+
+        with self._lock:
+            if normalized == self.resolvers:
+                return False
+
+            old_health = self._health
+            old_fail = self._fail_streak
+            old_primary = self._current_primary
+
+            self.resolvers = list(normalized)
+            self._health = {
+                r: old_health.get(r, ResolverHealth(resolver_ip=r))
+                for r in self.resolvers
+            }
+            self._fail_streak = {
+                r: old_fail.get(r, 0)
+                for r in self.resolvers
+            }
+
+            if old_primary in self.resolvers:
+                self._current_primary = old_primary
+            else:
+                self._select_primary_locked(time.time())
+
+            return True
 
     @staticmethod
     def _normalize_reason(reason: Optional[str], is_timeout: bool) -> str:

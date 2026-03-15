@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from storm_resolver_e2e_ranker import ResolverRankRow, parse_resolver_tokens, rank_rows, select_top
+from storm_resolver_e2e_ranker import (
+    ResolverRankRow,
+    _limit_per_prefix24,
+    parse_resolver_tokens,
+    rank_rows,
+    select_top,
+)
 
 
 def test_parse_resolver_tokens_dedupes():
@@ -25,3 +31,17 @@ def test_select_top_falls_back_when_no_success():
     ]
     selected = select_top(rows, take=2)
     assert selected == ["r1", "r2"]
+
+
+def test_limit_per_prefix24_keeps_diversity():
+    items = [
+        "1.1.1.1",
+        "1.1.1.2",
+        "1.1.1.3",
+        "8.8.8.8",
+    ]
+    assert _limit_per_prefix24(items, max_per_prefix24=2) == [
+        "1.1.1.1",
+        "1.1.1.2",
+        "8.8.8.8",
+    ]

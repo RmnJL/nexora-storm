@@ -10,6 +10,7 @@ import asyncio
 import base64
 import socket
 from dataclasses import dataclass
+from threading import Lock
 from typing import Optional, Tuple
 
 import dns.message
@@ -236,8 +237,24 @@ class DNSGateway:
         zone: str = "tunnel.zone",
         qtype: str = "TXT",
     ):
-        self.resolvers = resolvers
+        self._resolver_lock = Lock()
+        self.resolvers = _ordered_dedupe(resolvers)
         self.transport = DNSTransport(zone=zone, qtype=qtype)
+
+    def set_resolvers(self, resolvers: list[str]) -> bool:
+        """Hot-reload resolvers used by gateway."""
+        normalized = _ordered_dedupe(resolvers)
+        if not normalized:
+            return False
+        with self._resolver_lock:
+            if normalized == self.resolvers:
+                return False
+            self.resolvers = normalized
+            return True
+
+    def get_resolvers(self) -> list[str]:
+        with self._resolver_lock:
+            return list(self.resolvers)
     
     async def send_to_any(
         self,
@@ -268,7 +285,10 @@ class DNSGateway:
         resolver_order: Optional[list[str]] = None,
         fanout: int = 0,
     ) -> DNSQueryResult:
-        ordered = _ordered_dedupe(resolver_order if resolver_order else self.resolvers)
+        if resolver_order:
+            ordered = _ordered_dedupe(resolver_order)
+        else:
+            ordered = self.get_resolvers()
         if not ordered:
             return DNSQueryResult(
                 resolver="",

@@ -165,10 +165,13 @@ def evaluate_health(stats: dict[str, Any], success_threshold: float, latency_thr
 
 
 def run_cmdline(cmdline: str) -> tuple[bool, str]:
-    if not cmdline.strip():
+    raw = str(cmdline or "").strip()
+    if not raw:
         return False, "empty cmd"
+    if raw in {"-", "none", "None", "off", "OFF"}:
+        return True, "skipped"
     try:
-        cmd = shlex.split(cmdline)
+        cmd = shlex.split(raw)
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         ok = proc.returncode == 0
         detail = (proc.stdout or proc.stderr or "").strip()

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import ipaddress
 import logging
+import os
 
 from storm_connection import ConnectionConfig, ConnectionManager, STORMConnection
 from storm_dns import DNSGateway
@@ -16,6 +18,39 @@ from storm_failover import ResolverSelector
 from storm_proto import PacketFlags, make_packet
 
 log = logging.getLogger("storm-client")
+
+
+def parse_resolver_tokens(text: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in text.replace("\n", " ").split(" "):
+        ip = token.strip()
+        if not ip or ip in seen:
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.version != 4 or not addr.is_global:
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
+def load_resolvers_file(path: str, min_selected: int, max_selected: int) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return []
+    selected = parse_resolver_tokens(raw)
+    if not selected:
+        return []
+    capped = selected[: max(1, int(max_selected))]
+    if len(capped) < max(1, int(min_selected)):
+        return []
+    return capped
 
 
 class STORMClient:
@@ -31,6 +66,10 @@ class STORMClient:
         poll_interval: float = 0.2,
         dns_timeout: float = 3.0,
         resolver_fanout: int = 3,
+        resolvers_watch_file: str = "",
+        resolvers_watch_interval: float = 2.0,
+        resolvers_watch_min: int = 2,
+        resolvers_watch_max: int = 8,
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -39,15 +78,23 @@ class STORMClient:
         self.poll_interval = max(0.05, poll_interval)
         self.dns_timeout = max(0.5, float(dns_timeout))
         self.resolver_fanout = max(1, int(resolver_fanout))
-        
+        self.resolvers_watch_file = str(resolvers_watch_file or "").strip()
+        self.resolvers_watch_interval = max(0.3, float(resolvers_watch_interval))
+        self.resolvers_watch_min = max(1, int(resolvers_watch_min))
+        self.resolvers_watch_max = max(self.resolvers_watch_min, int(resolvers_watch_max))
+
         # Resolver management
-        self.resolver_selector = ResolverSelector(resolvers)
+        initial = parse_resolver_tokens(" ".join(resolvers)) or list(resolvers)
+        self.resolver_selector = ResolverSelector(initial)
         self.dns_gateway = DNSGateway(
-            resolvers=resolvers,
+            resolvers=initial,
             zone=zone,
             qtype=qtype,
         )
-        
+        self._current_resolvers = list(initial)
+        self._resolver_watch_task: asyncio.Task | None = None
+        self._resolver_watch_last_mtime: float = 0.0
+
         # Connection management
         self.conn_config = ConnectionConfig()
         self.conn_manager = ConnectionManager(self.conn_config)
@@ -65,9 +112,49 @@ class STORMClient:
         )
         
         self.running = True
-        
-        async with server:
-            await server.serve_forever()
+        if self.resolvers_watch_file:
+            self._resolver_watch_task = asyncio.create_task(self._watch_resolvers_file())
+
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            self.running = False
+            if self._resolver_watch_task:
+                self._resolver_watch_task.cancel()
+                await asyncio.gather(self._resolver_watch_task, return_exceptions=True)
+
+    async def _watch_resolvers_file(self) -> None:
+        """Hot-reload resolver set from file without restarting storm-client."""
+        while self.running:
+            try:
+                try:
+                    mtime = os.path.getmtime(self.resolvers_watch_file)
+                except OSError:
+                    mtime = 0.0
+                if mtime != self._resolver_watch_last_mtime:
+                    self._resolver_watch_last_mtime = mtime
+                    selected = load_resolvers_file(
+                        path=self.resolvers_watch_file,
+                        min_selected=self.resolvers_watch_min,
+                        max_selected=self.resolvers_watch_max,
+                    )
+                    if selected:
+                        changed_sel = self.resolver_selector.replace_resolvers(selected)
+                        changed_dns = self.dns_gateway.set_resolvers(selected)
+                        if changed_sel or changed_dns:
+                            self._current_resolvers = list(selected)
+                            log.info(
+                                "hot-reloaded resolvers count=%d first=%s",
+                                len(selected),
+                                selected[0],
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("resolver watch failed: %s", exc)
+
+            await asyncio.sleep(self.resolvers_watch_interval)
     
     async def handle_connection(
         self,
@@ -311,6 +398,29 @@ async def main():
         default=3,
         help="How many resolvers to query in parallel per retry window",
     )
+    parser.add_argument(
+        "--resolvers-watch-file",
+        default="",
+        help="Optional file to hot-reload resolver list from",
+    )
+    parser.add_argument(
+        "--resolvers-watch-interval",
+        type=float,
+        default=2.0,
+        help="Hot-reload check interval in seconds",
+    )
+    parser.add_argument(
+        "--resolvers-watch-min",
+        type=int,
+        default=2,
+        help="Minimum resolvers required in watch file before applying",
+    )
+    parser.add_argument(
+        "--resolvers-watch-max",
+        type=int,
+        default=8,
+        help="Maximum resolvers loaded from watch file",
+    )
     args = parser.parse_args()
     
     listen_host, listen_port = args.listen.rsplit(":", 1)
@@ -330,6 +440,10 @@ async def main():
         poll_interval=args.poll_interval,
         dns_timeout=args.dns_timeout,
         resolver_fanout=args.resolver_fanout,
+        resolvers_watch_file=args.resolvers_watch_file,
+        resolvers_watch_interval=args.resolvers_watch_interval,
+        resolvers_watch_min=args.resolvers_watch_min,
+        resolvers_watch_max=args.resolvers_watch_max,
     )
     
     try:

@@ -16,6 +16,7 @@ Environment=STORM_RESOLVER_MAX_PROBE=300
 Environment=STORM_RESOLVER_CONCURRENCY=60
 Environment=STORM_DNS_TIMEOUT=3.0
 Environment=STORM_RESOLVER_FANOUT=3
+Environment=STORM_RESOLVER_WATCH_INTERVAL=2.0
 ExecStart=/opt/nexora-storm/run_storm_client_auto.sh
 Restart=always
 RestartSec=2

@@ -158,6 +158,16 @@ class TestFailover:
         health = selector.get_health("resolver1")
         assert health["blacklisted"]
 
+    def test_replace_resolvers_hot_reload_preserves_and_updates_set(self):
+        selector = ResolverSelector(["1.1.1.1", "8.8.8.8"])
+        selector.report_success("8.8.8.8", 90.0)
+        changed = selector.replace_resolvers(["8.8.8.8", "9.9.9.9"])
+        assert changed is True
+        ranked = selector.rank_candidates()
+        assert "8.8.8.8" in ranked
+        assert "9.9.9.9" in ranked
+        assert "1.1.1.1" not in ranked
+
 
 class TestConnection:
     """Test connection management"""
