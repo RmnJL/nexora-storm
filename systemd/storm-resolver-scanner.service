@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/nexora-storm
-ExecStart=/opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_resolver_scanner.py --resolvers-file /opt/nexora-storm/data/resolvers.txt --output /opt/nexora-storm/state/resolvers_scan.json --sample-cursor-file /opt/nexora-storm/state/resolvers_scan_cursor.txt --zone t1.phonexpress.ir --timeout 1.5 --concurrency 60 --max-probe 300 --sample-mode sequential --sticky-rows 64 --sticky-pools active,standby --rounds 2 --min-success 1 --deep-protocol-check 1 --protocol-roundtrips 2 --active-pool-size 8 --standby-pool-size 32 --publish-min-pass-rate 0.55 --publish-max-latency-ms 900 --publish-min-score 0 --rollback-ttl 1800 --loop 120
+ExecStart=/opt/nexora-storm/.venv/bin/python /opt/nexora-storm/storm_resolver_scanner.py --resolvers-file /opt/nexora-storm/data/resolvers.txt --output /opt/nexora-storm/state/resolvers_scan.json --sample-cursor-file /opt/nexora-storm/state/resolvers_scan_cursor.txt --zone t1.phonexpress.ir --timeout 1.5 --concurrency 60 --max-probe 300 --sample-mode sequential --sticky-rows 64 --sticky-pools active,standby --rounds 2 --min-success 1 --deep-protocol-check 1 --protocol-roundtrips 2 --active-pool-size 8 --standby-pool-size 32 --max-per-prefix24 2 --publish-min-pass-rate 0.55 --publish-max-latency-ms 900 --publish-min-score 0 --rollback-ttl 1800 --loop 120
 Restart=always
 RestartSec=5
 StandardOutput=journal

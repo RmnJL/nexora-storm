@@ -21,7 +21,7 @@ import time
 from typing import Any
 
 from storm_dns import DNSTransport
-from storm_proto import PacketFlags, make_packet, parse_packet
+from storm_proto import FrameType, PacketFlags, make_frame, make_packet, parse_frame, parse_packet
 from storm_resolver_picker import choose_probe_candidates, load_resolvers_file
 
 log = logging.getLogger("storm-resolver-scanner")
@@ -58,6 +58,39 @@ def _dedupe_resolvers(items: list[str]) -> list[str]:
         if not _is_public_ipv4(ip):
             continue
         seen.add(ip)
+        out.append(ip)
+    return out
+
+
+def _prefix24_key(ip: str) -> str:
+    parts = str(ip).split(".")
+    if len(parts) != 4:
+        return ""
+    return ".".join(parts[:3])
+
+
+def _limit_prefix24(items: list[str], max_per_prefix24: int) -> list[str]:
+    cap = int(max_per_prefix24)
+    if cap <= 0:
+        return list(items)
+    out: list[str] = []
+    counts: dict[str, int] = {}
+    for ip in items:
+        prefix = _prefix24_key(ip)
+        if not prefix:
+            continue
+        cur = counts.get(prefix, 0)
+        if cur >= cap:
+            continue
+        counts[prefix] = cur + 1
+        out.append(ip)
+    if len(out) >= len(items):
+        return out
+    # Backfill without prefix cap so pool size can still be reached.
+    seen = set(out)
+    for ip in items:
+        if ip in seen:
+            continue
         out.append(ip)
     return out
 
@@ -233,7 +266,13 @@ async def _run_quick_phase(
 
     async def _run(ip: str) -> ScanRow:
         async with sem:
-            ok, latency_ms, err = await _probe_once(transport, ip, timeout)
+            ok, latency_ms, err = await _probe_once(
+                transport=transport,
+                resolver=ip,
+                timeout=timeout,
+                protocol_roundtrips=1,
+                data_probe=False,
+            )
             pass_rate = 1.0 if ok else 0.0
             return ScanRow(
                 resolver=ip,
@@ -269,13 +308,15 @@ def _classify_pools(
     failed_rows: list[ScanRow],
     active_pool_size: int,
     standby_pool_size: int,
+    max_per_prefix24: int,
 ) -> tuple[list[str], list[str], list[str]]:
     ranked = sorted(publish_rows, key=_row_rank_key)
     active_n = max(1, int(active_pool_size))
     standby_n = max(0, int(standby_pool_size))
 
-    active = [r.resolver for r in ranked[:active_n]]
-    standby = [r.resolver for r in ranked[active_n : active_n + standby_n]]
+    diverse = _limit_prefix24([r.resolver for r in ranked], max_per_prefix24=max_per_prefix24)
+    active = diverse[:active_n]
+    standby = diverse[active_n : active_n + standby_n]
     quarantine = [r.resolver for r in failed_rows]
     return active, standby, quarantine
 
@@ -358,6 +399,7 @@ async def _probe_once(
     resolver: str,
     timeout: float,
     protocol_roundtrips: int = 1,
+    data_probe: bool = False,
 ) -> tuple[bool, float, str]:
     rounds = max(1, int(protocol_roundtrips))
     latency_samples: list[float] = []
@@ -369,6 +411,7 @@ async def _probe_once(
             resolver=resolver,
             timeout=timeout,
             extra_keepalive=rounds > 1,
+            data_probe=data_probe,
         )
         if not ok:
             return False, latency_ms, err
@@ -385,6 +428,7 @@ async def _probe_protocol_session(
     resolver: str,
     timeout: float,
     extra_keepalive: bool,
+    data_probe: bool,
 ) -> tuple[bool, float, str]:
     conn_id = secrets.token_bytes(4)
     packet = make_packet(
@@ -409,11 +453,44 @@ async def _probe_protocol_session(
             return False, result.latency_ms, "conn-id-mismatch"
 
         latencies = [result.latency_ms]
+        if data_probe:
+            data_frame = make_frame(
+                frame_type=FrameType.DATA,
+                frame_flags=0,
+                seq_group=0,
+                payload=secrets.token_bytes(96),
+            )
+            data_packet = make_packet(
+                conn_id=conn_id,
+                flags=PacketFlags.DATA,
+                seq_offset=1,
+                payload=data_frame,
+            )
+            result_data = await transport.send_query_detailed(
+                packet=data_packet,
+                resolver_ip=resolver,
+                session_id="scan",
+                timeout=timeout,
+            )
+            if result_data.response_packet is None:
+                err = result_data.error_class or result_data.error_detail or "no-response"
+                return False, result_data.latency_ms, err
+            header_data, payload_data = parse_packet(result_data.response_packet)
+            if header_data.conn_id != conn_id:
+                return False, result_data.latency_ms, "conn-id-mismatch"
+            # If server emits DATA, payload must decode as frame.
+            if (header_data.flags & PacketFlags.DATA) and payload_data:
+                try:
+                    parse_frame(payload_data)
+                except Exception:
+                    return False, result_data.latency_ms, "bad-data-frame"
+            latencies.append(result_data.latency_ms)
+
         if extra_keepalive:
             packet2 = make_packet(
                 conn_id=conn_id,
                 flags=PacketFlags.KEEPALIVE,
-                seq_offset=1,
+                seq_offset=2 if data_probe else 1,
                 payload=b"",
             )
             result2 = await transport.send_query_detailed(
@@ -442,6 +519,7 @@ async def _probe_resolver(
     rounds: int,
     min_success: int,
     protocol_roundtrips: int,
+    data_probe: bool,
 ) -> ScanRow:
     probes = max(1, int(rounds))
     need = max(1, min(int(min_success), probes))
@@ -455,6 +533,7 @@ async def _probe_resolver(
             resolver=resolver,
             timeout=timeout,
             protocol_roundtrips=protocol_roundtrips,
+            data_probe=data_probe,
         )
         if ok:
             successes += 1
@@ -556,6 +635,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
                 rounds=args.rounds,
                 min_success=args.min_success,
                 protocol_roundtrips=args.protocol_roundtrips if bool(args.deep_protocol_check) else 1,
+                data_probe=bool(args.deep_protocol_check),
             )
 
     tasks = [asyncio.create_task(_run(ip)) for ip in candidates]
@@ -585,6 +665,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         failed_rows=failed_rows,
         active_pool_size=args.active_pool_size,
         standby_pool_size=args.standby_pool_size,
+        max_per_prefix24=args.max_per_prefix24,
     )
     active_set = set(active)
     standby_set = set(standby)
@@ -632,6 +713,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "deep_protocol_check": bool(args.deep_protocol_check),
             "protocol_roundtrips": int(args.protocol_roundtrips),
+            "max_per_prefix24": int(args.max_per_prefix24),
         },
         "pools": {
             "active": active,
@@ -695,6 +777,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-roundtrips", type=int, default=2, help="per-round protocol roundtrips in deep phase")
     parser.add_argument("--active-pool-size", type=int, default=12)
     parser.add_argument("--standby-pool-size", type=int, default=64)
+    parser.add_argument("--max-per-prefix24", type=int, default=2, help="max active/standby entries from same /24; <=0 disables")
     parser.add_argument("--publish-min-pass-rate", type=float, default=0.55)
     parser.add_argument("--publish-max-latency-ms", type=float, default=900.0)
     parser.add_argument("--publish-min-score", type=float, default=0.0)

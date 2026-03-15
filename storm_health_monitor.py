@@ -30,6 +30,7 @@ class MonitorState:
     fail_streak: int = 0
     last_action_ts: float = 0.0
     last_reason: str = ""
+    last_rank_ts: float = 0.0
 
 
 def parse_resolver_tokens(text: str) -> list[str]:
@@ -119,6 +120,7 @@ def load_state(path: str) -> MonitorState:
             fail_streak=int(data.get("fail_streak", 0) or 0),
             last_action_ts=float(data.get("last_action_ts", 0.0) or 0.0),
             last_reason=str(data.get("last_reason", "") or ""),
+            last_rank_ts=float(data.get("last_rank_ts", 0.0) or 0.0),
         )
     except Exception:
         return MonitorState()
@@ -256,6 +258,11 @@ async def run_loop(args: argparse.Namespace) -> int:
             "rank_ok": False,
             "rank_detail": "",
             "rank_selected": [],
+            "periodic_rank_due": False,
+            "periodic_rank_attempted": False,
+            "periodic_rank_ok": False,
+            "periodic_rank_detail": "",
+            "periodic_rank_selected": [],
         }
 
         results, stats = await run_probe_batch(args)
@@ -271,12 +278,35 @@ async def run_loop(args: argparse.Namespace) -> int:
             state.fail_streak += 1
             state.last_reason = reason
 
+        rank_period = max(0.0, float(args.e2e_rank_period_sec))
+        periodic_rank_due = (
+            bool(args.e2e_rank_cmd.strip())
+            and rank_period > 0
+            and (now - state.last_rank_ts) >= rank_period
+        )
+        action["periodic_rank_due"] = periodic_rank_due
+        if periodic_rank_due:
+            action["periodic_rank_attempted"] = True
+            pr_ok, pr_detail = run_cmdline(args.e2e_rank_cmd)
+            action["periodic_rank_ok"] = pr_ok
+            action["periodic_rank_detail"] = pr_detail
+            action["periodic_rank_selected"] = load_resolver_file(args.active_file)[: max(1, int(args.take))]
+            if action["periodic_rank_ok"] and not action["periodic_rank_selected"]:
+                action["periodic_rank_ok"] = False
+                action["periodic_rank_detail"] = (
+                    f"{pr_detail}; no resolvers written to active file"
+                    if pr_detail
+                    else "no resolvers written to active file"
+                )
+            state.last_rank_ts = now
+
         if not healthy and state.fail_streak >= args.fail_streak_trigger:
             if (now - state.last_action_ts) >= args.action_cooldown:
                 action["triggered"] = True
                 rank_eligible = (
                     bool(args.e2e_rank_cmd.strip())
                     and state.fail_streak >= max(1, int(args.e2e_rank_min_fail_streak))
+                    and not bool(action["periodic_rank_attempted"])
                 )
                 if rank_eligible:
                     action["rank_attempted"] = True
@@ -379,6 +409,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--failover-restart-cmd", default="systemctl restart storm-client")
     parser.add_argument("--e2e-rank-min-fail-streak", type=int, default=6)
     parser.add_argument("--e2e-rank-cmd", default="")
+    parser.add_argument("--e2e-rank-period-sec", type=float, default=900.0, help="run e2e rank command periodically; <=0 disables")
 
     parser.add_argument("--state-json", default="state/health_monitor_state.json")
     parser.add_argument("--report-json", default="state/health_monitor_report.json")

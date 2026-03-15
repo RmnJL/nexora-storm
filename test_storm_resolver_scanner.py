@@ -33,10 +33,28 @@ def test_classify_pools_splits_active_and_standby():
         failed_rows=failed,
         active_pool_size=1,
         standby_pool_size=2,
+        max_per_prefix24=2,
     )
     assert active == ["1.1.1.1"]
     assert standby == ["8.8.8.8", "9.9.9.9"]
     assert quarantine == ["4.4.4.4"]
+
+
+def test_classify_pools_applies_prefix24_diversity():
+    publish = [
+        ScanRow("1.1.1.1", True, 2, 2, 1.0, 20.0, 980.0, ""),
+        ScanRow("1.1.1.2", True, 2, 2, 1.0, 21.0, 979.0, ""),
+        ScanRow("2.2.2.2", True, 2, 2, 1.0, 22.0, 978.0, ""),
+    ]
+    active, standby, _ = _classify_pools(
+        publish_rows=publish,
+        failed_rows=[],
+        active_pool_size=2,
+        standby_pool_size=0,
+        max_per_prefix24=1,
+    )
+    assert active == ["1.1.1.1", "2.2.2.2"]
+    assert standby == []
 
 
 def test_build_resolver_list_preserves_priority_order():

@@ -59,6 +59,38 @@ def _dedupe_public_ipv4(items: list[str]) -> list[str]:
     return out
 
 
+def _prefix24_key(ip: str) -> str:
+    parts = str(ip).split(".")
+    if len(parts) != 4:
+        return ""
+    return ".".join(parts[:3])
+
+
+def _limit_per_prefix24(items: list[str], max_per_prefix24: int, backfill: bool = True) -> list[str]:
+    cap = int(max_per_prefix24)
+    if cap <= 0:
+        return list(items)
+    out: list[str] = []
+    counts: dict[str, int] = {}
+    for ip in items:
+        prefix = _prefix24_key(ip)
+        if not prefix:
+            continue
+        cur = counts.get(prefix, 0)
+        if cur >= cap:
+            continue
+        counts[prefix] = cur + 1
+        out.append(ip)
+    if len(out) >= len(items) or not backfill:
+        return out
+    seen = set(out)
+    for ip in items:
+        if ip in seen:
+            continue
+        out.append(ip)
+    return out
+
+
 def _parse_allowed_pools(raw: str) -> set[str]:
     pools = {x.strip().lower() for x in str(raw).split(",") if x.strip()}
     if not pools:
@@ -172,6 +204,7 @@ def compute_selection(
     take: int,
     min_healthy: int,
     allow_fallback: bool,
+    max_per_prefix24: int,
 ) -> tuple[list[str], int, bool]:
     target_len = max(1, take)
     healthy = [r for r in results if r.ok]
@@ -184,10 +217,30 @@ def compute_selection(
     # under lossy conditions. Fill the remaining slots from the ranked fallback
     # pool to preserve multipath behavior on restricted networks.
     basis = healthy if healthy else results
-    selected = rank_resolvers(basis, target_len)
+    selected = rank_resolvers(basis, max(target_len * 3, target_len))
+    selected = _limit_per_prefix24(
+        selected,
+        max_per_prefix24=max_per_prefix24,
+        backfill=False,
+    )
     if len(selected) < target_len:
         seen = set(selected)
         fallback_ranked = rank_resolvers(results, max(target_len * 3, target_len))
+        for resolver in fallback_ranked:
+            if resolver in seen:
+                continue
+            selected.append(resolver)
+            seen.add(resolver)
+            if len(selected) >= target_len:
+                break
+    selected = _limit_per_prefix24(
+        selected,
+        max_per_prefix24=max_per_prefix24,
+        backfill=False,
+    )
+    if len(selected) < target_len:
+        seen = set(selected)
+        fallback_ranked = rank_resolvers(results, max(target_len * 4, target_len))
         for resolver in fallback_ranked:
             if resolver in seen:
                 continue
@@ -299,6 +352,7 @@ class ResolverDaemon:
             take=self.args.take,
             min_healthy=self.args.min_healthy,
             allow_fallback=self.args.allow_fallback,
+            max_per_prefix24=self.args.max_per_prefix24,
         )
 
         healthy_ranked = rank_resolvers([r for r in results if r.ok], self.args.healthy_out_max)
@@ -435,6 +489,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--take", type=int, default=4)
     parser.add_argument("--min-healthy", type=int, default=2)
     parser.add_argument("--min-active-floor", type=int, default=4, help="keep at least this many active resolvers when health is below threshold")
+    parser.add_argument("--max-per-prefix24", type=int, default=2, help="max selected resolvers from same /24; <=0 disables")
     parser.add_argument("--allow-fallback", action="store_true")
     parser.add_argument("--healthy-out", default="state/resolvers_healthy.txt")
     parser.add_argument("--healthy-out-max", type=int, default=256)

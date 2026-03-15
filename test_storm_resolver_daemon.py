@@ -37,6 +37,7 @@ def test_compute_selection_strict_mode_fails_on_low_health():
         take=2,
         min_healthy=2,
         allow_fallback=False,
+        max_per_prefix24=2,
     )
     assert selected == []
     assert healthy_count == 1
@@ -54,11 +55,29 @@ def test_compute_selection_fills_to_take_with_fallback_ranked_results():
         take=3,
         min_healthy=1,
         allow_fallback=False,
+        max_per_prefix24=2,
     )
     assert eligible
     assert healthy_count == 1
     assert len(selected) == 3
     assert selected[0] == "1.1.1.1"
+
+
+def test_compute_selection_applies_prefix24_diversity():
+    results = [
+        ProbeResult(resolver="1.1.1.1", ok=True, latency_ms=20.0),
+        ProbeResult(resolver="1.1.1.2", ok=True, latency_ms=21.0),
+        ProbeResult(resolver="2.2.2.2", ok=True, latency_ms=22.0),
+    ]
+    selected, _, eligible = compute_selection(
+        results=results,
+        take=2,
+        min_healthy=1,
+        allow_fallback=False,
+        max_per_prefix24=1,
+    )
+    assert eligible
+    assert selected == ["1.1.1.1", "2.2.2.2"]
 
 
 def test_should_restart_honors_cooldown():
