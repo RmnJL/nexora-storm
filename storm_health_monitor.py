@@ -89,6 +89,45 @@ def load_target_file(path: str, default_port: int) -> list[tuple[str, int]]:
         return []
 
 
+def load_reentry_candidates(
+    scanner_json: str,
+    standby_max: int,
+    quarantine_max: int,
+    max_total: int,
+) -> list[str]:
+    if not scanner_json or not os.path.isfile(scanner_json):
+        return []
+    try:
+        with open(scanner_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    standby: list[str] = []
+    quarantine: list[str] = []
+    pools = data.get("pools", {})
+    if isinstance(pools, dict):
+        vals = pools.get("standby", [])
+        if isinstance(vals, list):
+            standby.extend(str(x).strip() for x in vals)
+        qvals = pools.get("quarantine", [])
+        if isinstance(qvals, list):
+            quarantine.extend(str(x).strip() for x in qvals)
+
+    qrows = data.get("quarantine_resolvers", [])
+    if isinstance(qrows, list):
+        quarantine.extend(
+            str(row.get("resolver", "")).strip()
+            for row in qrows
+            if isinstance(row, dict)
+        )
+
+    standby = parse_resolver_tokens(" ".join(standby))[: max(0, int(standby_max))]
+    quarantine = parse_resolver_tokens(" ".join(quarantine))[: max(0, int(quarantine_max))]
+    merged = parse_resolver_tokens(" ".join(standby + quarantine))
+    return merged[: max(0, int(max_total))]
+
+
 def atomic_write_text(path: str, content: str) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -188,6 +227,59 @@ def run_restart_cmd(cmdline: str) -> tuple[bool, str]:
     return run_cmdline(cmdline)
 
 
+def is_active_weak(active: list[str], take: int, min_active: int) -> bool:
+    threshold = max(1, min(int(take), int(min_active)))
+    return len(active) < threshold
+
+
+def _write_tmp_candidates(path: str, resolvers: list[str]) -> str:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(
+        parent,
+        f"reentry_candidates.tmp-{os.getpid()}-{int(time.time() * 1000)}.txt",
+    )
+    atomic_write_text(tmp, " ".join(resolvers).strip() + "\n")
+    return tmp
+
+
+def _cleanup_file(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def run_reentry_rank(
+    rank_cmd: str,
+    active_file: str,
+    healthy_file: str,
+    take: int,
+    candidates: list[str],
+) -> tuple[bool, str, list[str]]:
+    if not rank_cmd.strip():
+        return False, "empty rank cmd", []
+    if not candidates:
+        return False, "no reentry candidates", []
+
+    tmp_candidates = _write_tmp_candidates(active_file, candidates)
+    try:
+        cmd = str(rank_cmd).strip()
+        cmd += f" --candidates-file {shlex.quote(tmp_candidates)}"
+        cmd += f" --fallback-file {shlex.quote(healthy_file)}"
+        cmd += " --scanner-max-items 0"
+        cmd += f" --max-candidates {max(1, len(candidates))}"
+        cmd += f" --take {max(1, int(take))}"
+        ok, detail = run_cmdline(cmd)
+        selected = load_resolver_file(active_file)[: max(1, int(take))]
+        if ok and not selected:
+            return False, (f"{detail}; no resolvers written to active file" if detail else "no resolvers written to active file"), []
+        return ok, detail, selected
+    finally:
+        _cleanup_file(tmp_candidates)
+
+
 def apply_failover_rotation(active_file: str, healthy_file: str, take: int) -> tuple[bool, list[str]]:
     active = load_resolver_file(active_file)
     healthy = load_resolver_file(healthy_file)
@@ -263,6 +355,10 @@ async def run_loop(args: argparse.Namespace) -> int:
             "periodic_rank_ok": False,
             "periodic_rank_detail": "",
             "periodic_rank_selected": [],
+            "reentry_attempted": False,
+            "reentry_ok": False,
+            "reentry_detail": "",
+            "reentry_selected": [],
         }
 
         results, stats = await run_probe_batch(args)
@@ -303,10 +399,43 @@ async def run_loop(args: argparse.Namespace) -> int:
         if not healthy and state.fail_streak >= args.fail_streak_trigger:
             if (now - state.last_action_ts) >= args.action_cooldown:
                 action["triggered"] = True
+                active_now = load_resolver_file(args.active_file)
+                reentry_eligible = (
+                    bool(args.reentry_enable)
+                    and bool(args.e2e_rank_cmd.strip())
+                    and state.fail_streak >= max(1, int(args.reentry_min_fail_streak))
+                    and is_active_weak(
+                        active=active_now,
+                        take=args.take,
+                        min_active=args.reentry_active_min,
+                    )
+                )
+                if reentry_eligible:
+                    reentry_candidates = load_reentry_candidates(
+                        scanner_json=args.scanner_json,
+                        standby_max=args.reentry_standby_max,
+                        quarantine_max=args.reentry_quarantine_max,
+                        max_total=args.reentry_candidates_max,
+                    )
+                    action["reentry_attempted"] = True
+                    r_ok, r_detail, r_selected = run_reentry_rank(
+                        rank_cmd=args.e2e_rank_cmd,
+                        active_file=args.active_file,
+                        healthy_file=args.healthy_file,
+                        take=args.take,
+                        candidates=reentry_candidates,
+                    )
+                    action["reentry_ok"] = r_ok
+                    action["reentry_detail"] = r_detail
+                    action["reentry_selected"] = r_selected
+                    if r_selected:
+                        action["selected"] = r_selected
+
                 rank_eligible = (
                     bool(args.e2e_rank_cmd.strip())
                     and state.fail_streak >= max(1, int(args.e2e_rank_min_fail_streak))
                     and not bool(action["periodic_rank_attempted"])
+                    and not bool(action["reentry_ok"])
                 )
                 if rank_eligible:
                     action["rank_attempted"] = True
@@ -325,7 +454,7 @@ async def run_loop(args: argparse.Namespace) -> int:
 
                 if bool(args.failover_rotate):
                     # If e2e ranking failed, fall back to simple healthy-list rotation.
-                    if not action["rank_ok"]:
+                    if not action["rank_ok"] and not action["reentry_ok"]:
                         rotated, selected = apply_failover_rotation(
                             active_file=args.active_file,
                             healthy_file=args.healthy_file,
@@ -402,6 +531,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--active-file", default="state/resolvers_active.txt")
     parser.add_argument("--healthy-file", default="state/resolvers_healthy.txt")
+    parser.add_argument("--scanner-json", default="state/resolvers_scan.json")
     parser.add_argument("--take", type=int, default=4)
     parser.add_argument("--fail-streak-trigger", type=int, default=3)
     parser.add_argument("--action-cooldown", type=float, default=180.0)
@@ -410,6 +540,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--e2e-rank-min-fail-streak", type=int, default=6)
     parser.add_argument("--e2e-rank-cmd", default="")
     parser.add_argument("--e2e-rank-period-sec", type=float, default=900.0, help="run e2e rank command periodically; <=0 disables")
+    parser.add_argument("--reentry-enable", type=int, default=1)
+    parser.add_argument("--reentry-min-fail-streak", type=int, default=4)
+    parser.add_argument("--reentry-active-min", type=int, default=2)
+    parser.add_argument("--reentry-standby-max", type=int, default=24)
+    parser.add_argument("--reentry-quarantine-max", type=int, default=64)
+    parser.add_argument("--reentry-candidates-max", type=int, default=96)
 
     parser.add_argument("--state-json", default="state/health_monitor_state.json")
     parser.add_argument("--report-json", default="state/health_monitor_report.json")
