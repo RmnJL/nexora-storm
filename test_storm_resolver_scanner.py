@@ -9,9 +9,13 @@ from storm_resolver_scanner import (
     _build_resolver_list,
     _build_prefilter_candidates,
     _classify_pools,
+    _cooldown_for_fail_streak,
     _dedupe_resolvers,
+    _parse_cooldown_sequence,
     _load_runtime_state,
     _load_previous_report,
+    _prioritize_due_candidates,
+    _promote_due_runtime_entries,
     _resolve_phase1_limits,
     _runtime_state_payload,
     _select_quick_survivors,
@@ -280,11 +284,13 @@ def test_update_runtime_state_promote_and_demote_counts():
         active_set={"1.1.1.1"},
         standby_set=set(),
         now_ts=2000.0,
+        cooldown_steps=(30.0, 60.0, 120.0, 300.0, 600.0, 1200.0),
     )
     assert updated["1.1.1.1"].state == "active"
     assert updated["1.1.1.1"].fail_streak == 0
     assert updated["8.8.8.8"].state == "degraded"
     assert updated["8.8.8.8"].fail_streak == 1
+    assert updated["8.8.8.8"].next_probe_at_ts == 2030.0
     assert counters["promotion_count"] == 1
     assert counters["demotion_count"] == 1
 
@@ -307,7 +313,63 @@ def test_update_runtime_state_reentry_to_probation_when_not_in_pool():
         active_set=set(),
         standby_set=set(),
         now_ts=3000.0,
+        cooldown_steps=(30.0, 60.0, 120.0, 300.0, 600.0, 1200.0),
     )
     assert updated["9.9.9.9"].state == "probation"
     assert updated["9.9.9.9"].success_streak == 1
     assert counters["reentry_count"] == 1
+
+
+def test_parse_cooldown_sequence_uses_default_for_invalid_input():
+    values = _parse_cooldown_sequence("x,,")
+    assert values == (30.0, 60.0, 120.0, 300.0, 600.0, 1200.0)
+
+
+def test_cooldown_for_fail_streak_uses_ladder_cap():
+    steps = (30.0, 60.0, 120.0)
+    assert _cooldown_for_fail_streak(1, steps) == 30.0
+    assert _cooldown_for_fail_streak(2, steps) == 60.0
+    assert _cooldown_for_fail_streak(3, steps) == 120.0
+    assert _cooldown_for_fail_streak(7, steps) == 120.0
+
+
+def test_promote_due_runtime_entries_moves_quarantine_and_degraded():
+    runtime = {
+        "1.1.1.1": ResolverRuntimeState(
+            resolver="1.1.1.1",
+            state="quarantine",
+            next_probe_at_ts=100.0,
+        ),
+        "8.8.8.8": ResolverRuntimeState(
+            resolver="8.8.8.8",
+            state="degraded",
+            next_probe_at_ts=150.0,
+        ),
+        "9.9.9.9": ResolverRuntimeState(
+            resolver="9.9.9.9",
+            state="quarantine",
+            next_probe_at_ts=250.0,
+        ),
+    }
+    moved = _promote_due_runtime_entries(runtime, now_ts=200.0)
+    assert moved == 2
+    assert runtime["1.1.1.1"].state == "probation"
+    assert runtime["8.8.8.8"].state == "probation"
+    assert runtime["9.9.9.9"].state == "quarantine"
+
+
+def test_prioritize_due_candidates_keeps_due_first():
+    runtime = {
+        "1.1.1.1": ResolverRuntimeState(
+            resolver="1.1.1.1",
+            state="quarantine",
+            next_probe_at_ts=500.0,
+        ),
+        "8.8.8.8": ResolverRuntimeState(
+            resolver="8.8.8.8",
+            state="candidate",
+            next_probe_at_ts=0.0,
+        ),
+    }
+    ordered = _prioritize_due_candidates(["1.1.1.1", "8.8.8.8", "9.9.9.9"], runtime, now_ts=100.0)
+    assert ordered == ["8.8.8.8", "9.9.9.9", "1.1.1.1"]

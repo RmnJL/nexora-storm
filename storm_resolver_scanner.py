@@ -54,6 +54,7 @@ class ResolverRuntimeState:
 
 
 _RUNTIME_STATES = {"candidate", "probation", "standby", "active", "degraded", "quarantine"}
+_DEFAULT_REENTRY_COOLDOWN_SECONDS = (30.0, 60.0, 120.0, 300.0, 600.0, 1200.0)
 
 
 def _normalize_runtime_state(state: str) -> str:
@@ -68,6 +69,72 @@ def _runtime_state_counts(runtime: dict[str, ResolverRuntimeState]) -> dict[str,
     for item in runtime.values():
         counts[_normalize_runtime_state(item.state)] += 1
     return counts
+
+
+def _parse_cooldown_sequence(raw: str) -> tuple[float, ...]:
+    values: list[float] = []
+    for token in str(raw or "").split(","):
+        part = token.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except Exception:
+            continue
+        if value > 0:
+            values.append(value)
+    if not values:
+        return _DEFAULT_REENTRY_COOLDOWN_SECONDS
+    return tuple(values)
+
+
+def _cooldown_for_fail_streak(
+    fail_streak: int,
+    cooldown_steps: tuple[float, ...],
+) -> float:
+    if fail_streak <= 0:
+        return 0.0
+    steps = cooldown_steps or _DEFAULT_REENTRY_COOLDOWN_SECONDS
+    idx = min(max(0, int(fail_streak) - 1), len(steps) - 1)
+    return max(0.0, float(steps[idx]))
+
+
+def _is_probe_due_for_runtime(item: ResolverRuntimeState | None, now_ts: float) -> bool:
+    if item is None:
+        return True
+    state = _normalize_runtime_state(item.state)
+    if state in {"quarantine", "degraded"} and float(item.next_probe_at_ts) > float(now_ts):
+        return False
+    return True
+
+
+def _prioritize_due_candidates(
+    candidates: list[str],
+    runtime: dict[str, ResolverRuntimeState],
+    now_ts: float,
+) -> list[str]:
+    due: list[str] = []
+    delayed: list[str] = []
+    for ip in candidates:
+        item = runtime.get(ip)
+        if _is_probe_due_for_runtime(item, now_ts):
+            due.append(ip)
+        else:
+            delayed.append(ip)
+    return due + delayed
+
+
+def _promote_due_runtime_entries(runtime: dict[str, ResolverRuntimeState], now_ts: float) -> int:
+    moved = 0
+    for item in runtime.values():
+        state = _normalize_runtime_state(item.state)
+        if state not in {"quarantine", "degraded"}:
+            continue
+        if item.next_probe_at_ts <= 0 or float(now_ts) < float(item.next_probe_at_ts):
+            continue
+        item.state = "probation"
+        moved += 1
+    return moved
 
 
 def _ema(prev: float, sample: float, alpha: float) -> float:
@@ -146,6 +213,7 @@ def _update_runtime_state(
     active_set: set[str],
     standby_set: set[str],
     now_ts: float,
+    cooldown_steps: tuple[float, ...],
 ) -> tuple[dict[str, ResolverRuntimeState], dict[str, int]]:
     runtime: dict[str, ResolverRuntimeState] = dict(previous)
     counters = {
@@ -182,7 +250,10 @@ def _update_runtime_state(
             current.success_streak = 0
             current.fail_streak = max(0, current.fail_streak) + 1
             current.last_seen_fail_ts = now_ts
-            current.next_probe_at_ts = now_ts
+            current.next_probe_at_ts = now_ts + _cooldown_for_fail_streak(
+                current.fail_streak,
+                cooldown_steps,
+            )
             current.sr_short = _ema(current.sr_short, 0.0, 0.35)
             current.sr_long = _ema(current.sr_long, 0.0, 0.08)
             new_state = "quarantine" if current.fail_streak >= 3 else "degraded"
@@ -744,6 +815,8 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
 
     prev_rows, prev_resolver_list, prev_ts = _load_previous_report(args.output)
     runtime_state = _load_runtime_state(args.runtime_state_json)
+    cycle_now_ts = time.time()
+    runtime_reentry_due = _promote_due_runtime_entries(runtime_state, cycle_now_ts)
 
     cursor = int(getattr(args, "_sample_cursor", 0))
     sampled, new_cursor = _select_probe_candidates(
@@ -767,6 +840,16 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         prefilter_keep=prefilter_cap,
         prefilter_history_rows=args.prefilter_history_rows,
     )
+    prefilter_due = sum(
+        1
+        for ip in prefilter_candidates
+        if _is_probe_due_for_runtime(runtime_state.get(ip), cycle_now_ts)
+    )
+    prefilter_candidates = _prioritize_due_candidates(
+        prefilter_candidates,
+        runtime_state,
+        cycle_now_ts,
+    )
     setattr(args, "_sample_cursor", new_cursor)
     _save_cursor(args.sample_cursor_file, new_cursor)
     if not prefilter_candidates:
@@ -782,7 +865,17 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
     )
     quick_selected = _select_quick_survivors(quick_rows, quick_keep_cap)
     merged_candidates = sticky_candidates + quick_selected + sampled + prefilter_candidates
-    candidates = _dedupe_resolvers(merged_candidates)[:deep_probe_cap]
+    merged_unique = _dedupe_resolvers(merged_candidates)
+    merged_due = sum(
+        1
+        for ip in merged_unique
+        if _is_probe_due_for_runtime(runtime_state.get(ip), cycle_now_ts)
+    )
+    candidates = _prioritize_due_candidates(
+        merged_unique,
+        runtime_state,
+        cycle_now_ts,
+    )[:deep_probe_cap]
     if not candidates:
         raise RuntimeError("no resolvers available after quick-phase selection")
 
@@ -847,6 +940,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         active_set=active_set,
         standby_set=standby_set,
         now_ts=now_ts,
+        cooldown_steps=getattr(args, "_reentry_cooldowns", _DEFAULT_REENTRY_COOLDOWN_SECONDS),
     )
     _atomic_write_json(
         args.runtime_state_json,
@@ -881,6 +975,8 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "quick_selected": len(quick_selected),
             "quick_keep": quick_keep_cap,
             "deep_probe_cap": deep_probe_cap,
+            "prefilter_due": int(prefilter_due),
+            "deep_due": int(merged_due),
             "global_pass_rate_avg": round(
                 statistics.mean([row.pass_rate for row in rows]) if rows else 0.0,
                 4,
@@ -888,6 +984,10 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "deep_protocol_check": bool(args.deep_protocol_check),
             "protocol_roundtrips": int(args.protocol_roundtrips),
             "max_per_prefix24": int(args.max_per_prefix24),
+            "reentry_cooldown_seq_sec": list(
+                getattr(args, "_reentry_cooldowns", _DEFAULT_REENTRY_COOLDOWN_SECONDS)
+            ),
+            "runtime_reentry_due": int(runtime_reentry_due),
             "runtime_state_file": args.runtime_state_json,
             "runtime_state_total": len(runtime_state),
             "runtime_state_counts": runtime_counts,
@@ -959,6 +1059,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-pool-size", type=int, default=12)
     parser.add_argument("--standby-pool-size", type=int, default=64)
     parser.add_argument("--max-per-prefix24", type=int, default=2, help="max active/standby entries from same /24; <=0 disables")
+    parser.add_argument("--reentry-cooldown-seq", default="30,60,120,300,600,1200", help="comma separated cooldown ladder in seconds")
     parser.add_argument("--publish-min-pass-rate", type=float, default=0.55)
     parser.add_argument("--publish-max-latency-ms", type=float, default=900.0)
     parser.add_argument("--publish-min-score", type=float, default=0.0)
@@ -971,6 +1072,7 @@ def parse_args() -> argparse.Namespace:
 async def main() -> int:
     args = parse_args()
     setattr(args, "_sample_cursor", _load_cursor(args.sample_cursor_file))
+    setattr(args, "_reentry_cooldowns", _parse_cooldown_sequence(args.reentry_cooldown_seq))
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
