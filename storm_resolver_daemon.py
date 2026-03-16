@@ -268,6 +268,58 @@ def _unique_ordered(items: list[str]) -> list[str]:
     return out
 
 
+def _selection_change_count(previous: list[str], current: list[str]) -> int:
+    prev_set = set(_unique_ordered(previous))
+    cur_set = set(_unique_ordered(current))
+    removed = len(prev_set - cur_set)
+    added = len(cur_set - prev_set)
+    return max(removed, added)
+
+
+def _limit_selection_changes(
+    previous: list[str],
+    desired: list[str],
+    take: int,
+    max_changes: int,
+) -> list[str]:
+    target = max(1, int(take))
+    prev = _unique_ordered(previous)[:target]
+    want = _unique_ordered(desired)[:target]
+    if not prev:
+        return want
+    if max_changes < 0:
+        return want
+
+    remaining_changes = max(0, int(max_changes))
+    want_set = set(want)
+    kept: list[str] = []
+    for resolver in prev:
+        if resolver in want_set:
+            kept.append(resolver)
+            continue
+        if remaining_changes > 0:
+            remaining_changes -= 1
+            continue
+        kept.append(resolver)
+
+    for resolver in want:
+        if resolver in kept:
+            continue
+        kept.append(resolver)
+        if len(kept) >= target:
+            break
+
+    if len(kept) < target:
+        for resolver in prev:
+            if resolver in kept:
+                continue
+            kept.append(resolver)
+            if len(kept) >= target:
+                break
+
+    return kept[:target]
+
+
 def select_probe_subset(
     pool: list[str],
     previous_active: list[str],
@@ -313,6 +365,56 @@ class ResolverDaemon:
         self.args = args
         self.last_restart_at = 0.0
         self.probe_cursor = 0
+        self.change_window_started_at = 0.0
+        self.change_window_used = 0
+
+    def _stabilizer_allowance(self, now_ts: float, previous: list[str]) -> int:
+        if not previous:
+            return -1
+        window_sec = float(self.args.stabilizer_window_sec)
+        budget = int(self.args.stabilizer_max_changes)
+        if window_sec <= 0 or budget < 0:
+            return -1
+        if self.change_window_started_at <= 0 or (now_ts - self.change_window_started_at) >= window_sec:
+            self.change_window_started_at = now_ts
+            self.change_window_used = 0
+        return max(0, budget - self.change_window_used)
+
+    def _consume_stabilizer_changes(self, now_ts: float, count: int) -> None:
+        if count <= 0:
+            return
+        window_sec = float(self.args.stabilizer_window_sec)
+        budget = int(self.args.stabilizer_max_changes)
+        if window_sec <= 0 or budget < 0:
+            return
+        if self.change_window_started_at <= 0 or (now_ts - self.change_window_started_at) >= window_sec:
+            self.change_window_started_at = now_ts
+            self.change_window_used = 0
+        self.change_window_used = min(budget, self.change_window_used + int(count))
+
+    def _apply_stabilizer(
+        self,
+        previous: list[str],
+        desired: list[str],
+        take: int,
+        now_ts: float,
+    ) -> tuple[list[str], bool, int, int]:
+        desired_u = _unique_ordered(desired)[: max(1, int(take))]
+        allowance = self._stabilizer_allowance(now_ts, previous)
+        if allowance >= 0:
+            stabilized = _limit_selection_changes(
+                previous=previous,
+                desired=desired_u,
+                take=take,
+                max_changes=allowance,
+            )
+        else:
+            stabilized = desired_u
+        change_count = _selection_change_count(previous, stabilized)
+        if allowance >= 0:
+            self._consume_stabilizer_changes(now_ts, change_count)
+        throttled = stabilized != desired_u
+        return stabilized, throttled, allowance, change_count
 
     async def run_once(self) -> dict[str, Any]:
         scanner_pool = load_scanner_resolvers(
@@ -363,13 +465,22 @@ class ResolverDaemon:
         restarted = False
         restart_reason = ""
         forced_floor = False
+        stabilizer_throttled = False
+        stabilizer_allowance = -1
+        stabilizer_change_count = 0
 
         if eligible:
-            stabilized = stabilize_selection(previous, selected, self.args.take)
+            desired = stabilize_selection(previous, selected, self.args.take)
+            now = time.time()
+            stabilized, stabilizer_throttled, stabilizer_allowance, stabilizer_change_count = self._apply_stabilizer(
+                previous=previous,
+                desired=desired,
+                take=self.args.take,
+                now_ts=now,
+            )
             changed = stabilized != previous
             atomic_write_text(self.args.active_out, format_active_resolvers(stabilized))
 
-            now = time.time()
             if changed and self.args.restart_on_change:
                 if should_restart(self.last_restart_at, now, self.args.restart_cooldown):
                     restarted, restart_reason = self._restart_client()
@@ -384,14 +495,20 @@ class ResolverDaemon:
                 self.args.min_healthy,
                 self.args.allow_fallback,
             )
-            floor_take = max(1, min(self.args.take, self.args.min_active_floor))
+            floor_take = max(1, min(self.args.take, max(2, self.args.min_active_floor)))
             floor_basis = previous if previous else rank_resolvers(results, floor_take)
-            floor_selected = stabilize_selection(previous, floor_basis, floor_take)
+            desired_floor = stabilize_selection(previous, floor_basis, floor_take)
+            now = time.time()
+            floor_selected, stabilizer_throttled, stabilizer_allowance, stabilizer_change_count = self._apply_stabilizer(
+                previous=previous,
+                desired=desired_floor,
+                take=floor_take,
+                now_ts=now,
+            )
             if floor_selected:
                 forced_floor = True
                 changed = floor_selected != previous
                 atomic_write_text(self.args.active_out, format_active_resolvers(floor_selected))
-                now = time.time()
                 if changed and self.args.restart_on_change:
                     if should_restart(self.last_restart_at, now, self.args.restart_cooldown):
                         restarted, restart_reason = self._restart_client()
@@ -417,17 +534,24 @@ class ResolverDaemon:
             "forced_floor": forced_floor,
             "restarted": restarted,
             "restart_reason": restart_reason,
+            "stabilizer_throttled": stabilizer_throttled,
+            "stabilizer_allowance": stabilizer_allowance,
+            "stabilizer_change_count": stabilizer_change_count,
+            "stabilizer_window_started_at": self.change_window_started_at,
+            "stabilizer_window_changes_used": self.change_window_used,
             "results": [asdict(r) for r in results],
         }
         atomic_write_text(self.args.state_json, json.dumps(state, ensure_ascii=False, indent=2))
 
         log.info(
-            "cycle: pool=%d probed=%d healthy=%d eligible=%s changed=%s restarted=%s active=%s",
+            "cycle: pool=%d probed=%d healthy=%d eligible=%s changed=%s throttled=%s delta=%d restarted=%s active=%s",
             len(pool),
             len(probe_set),
             healthy_count,
             eligible,
             changed,
+            stabilizer_throttled,
+            stabilizer_change_count,
             restarted,
             " ".join(state["active"]),
         )
@@ -494,6 +618,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--healthy-out", default="state/resolvers_healthy.txt")
     parser.add_argument("--healthy-out-max", type=int, default=256)
     parser.add_argument("--interval", type=float, default=60.0)
+    parser.add_argument("--stabilizer-window-sec", type=float, default=30.0, help="hysteresis window for active-set changes")
+    parser.add_argument("--stabilizer-max-changes", type=int, default=2, help="max active resolver replacements per hysteresis window; <0 disables")
     parser.add_argument("--restart-on-change", action="store_true")
     parser.add_argument("--restart-cmd", default="systemctl restart storm-client")
     parser.add_argument("--restart-timeout", type=float, default=20.0)

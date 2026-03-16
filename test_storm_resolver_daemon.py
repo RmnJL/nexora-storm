@@ -7,6 +7,8 @@ from storm_resolver_daemon import (
     compute_selection,
     format_active_resolvers,
     load_scanner_resolvers,
+    _limit_selection_changes,
+    _selection_change_count,
     _parse_allowed_pools,
     parse_active_resolvers_text,
     select_probe_subset,
@@ -148,3 +150,22 @@ def test_load_scanner_resolvers_falls_back_to_resolver_list(tmp_path):
         allowed_pools=_parse_allowed_pools("active,standby"),
     )
     assert selected == ["1.1.1.1", "9.9.9.9"]
+
+
+def test_selection_change_count_tracks_replacements():
+    previous = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+    current = ["1.1.1.1", "4.4.4.4", "9.9.9.9"]
+    assert _selection_change_count(previous, current) == 1
+
+
+def test_limit_selection_changes_caps_replacements():
+    previous = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4"]
+    desired = ["8.8.8.8", "208.67.222.222", "9.9.9.9", "1.1.1.1"]
+    limited = _limit_selection_changes(
+        previous=previous,
+        desired=desired,
+        take=4,
+        max_changes=1,
+    )
+    assert _selection_change_count(previous, limited) <= 1
+    assert len(limited) == 4
