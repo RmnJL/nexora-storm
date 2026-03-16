@@ -40,6 +40,167 @@ class ScanRow:
     pool: str = ""
 
 
+@dataclass
+class ResolverRuntimeState:
+    resolver: str
+    fail_streak: int = 0
+    success_streak: int = 0
+    last_seen_ok_ts: float = 0.0
+    last_seen_fail_ts: float = 0.0
+    next_probe_at_ts: float = 0.0
+    sr_short: float = 0.0
+    sr_long: float = 0.0
+    state: str = "candidate"
+
+
+_RUNTIME_STATES = {"candidate", "probation", "standby", "active", "degraded", "quarantine"}
+
+
+def _normalize_runtime_state(state: str) -> str:
+    value = str(state or "").strip().lower()
+    if value in _RUNTIME_STATES:
+        return value
+    return "candidate"
+
+
+def _runtime_state_counts(runtime: dict[str, ResolverRuntimeState]) -> dict[str, int]:
+    counts = {key: 0 for key in sorted(_RUNTIME_STATES)}
+    for item in runtime.values():
+        counts[_normalize_runtime_state(item.state)] += 1
+    return counts
+
+
+def _ema(prev: float, sample: float, alpha: float) -> float:
+    p = max(0.0, min(1.0, float(prev)))
+    s = max(0.0, min(1.0, float(sample)))
+    a = max(0.0, min(1.0, float(alpha)))
+    if p <= 0.0 and s > 0.0:
+        return s
+    return (a * s) + ((1.0 - a) * p)
+
+
+def _dict_to_runtime_state(item: dict[str, Any]) -> ResolverRuntimeState | None:
+    if not isinstance(item, dict):
+        return None
+    resolver = str(item.get("resolver", "")).strip()
+    if not _is_public_ipv4(resolver):
+        return None
+    try:
+        return ResolverRuntimeState(
+            resolver=resolver,
+            fail_streak=max(0, int(item.get("fail_streak", 0) or 0)),
+            success_streak=max(0, int(item.get("success_streak", 0) or 0)),
+            last_seen_ok_ts=max(0.0, float(item.get("last_seen_ok_ts", 0.0) or 0.0)),
+            last_seen_fail_ts=max(0.0, float(item.get("last_seen_fail_ts", 0.0) or 0.0)),
+            next_probe_at_ts=max(0.0, float(item.get("next_probe_at_ts", 0.0) or 0.0)),
+            sr_short=max(0.0, min(1.0, float(item.get("sr_short", 0.0) or 0.0))),
+            sr_long=max(0.0, min(1.0, float(item.get("sr_long", 0.0) or 0.0))),
+            state=_normalize_runtime_state(str(item.get("state", "candidate") or "candidate")),
+        )
+    except Exception:
+        return None
+
+
+def _load_runtime_state(path: str) -> dict[str, ResolverRuntimeState]:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_rows = data.get("resolvers", [])
+        rows: list[dict[str, Any]]
+        if isinstance(raw_rows, dict):
+            rows = list(raw_rows.values())
+        elif isinstance(raw_rows, list):
+            rows = [x for x in raw_rows if isinstance(x, dict)]
+        else:
+            rows = []
+        out: dict[str, ResolverRuntimeState] = {}
+        for raw in rows:
+            parsed = _dict_to_runtime_state(raw)
+            if parsed is None:
+                continue
+            out[parsed.resolver] = parsed
+        return out
+    except Exception:
+        return {}
+
+
+def _runtime_state_payload(
+    runtime: dict[str, ResolverRuntimeState],
+    now_ts: float,
+) -> dict[str, Any]:
+    rows = sorted(runtime.values(), key=lambda item: item.resolver)
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+        "timestamp_ts": now_ts,
+        "total": len(rows),
+        "state_counts": _runtime_state_counts(runtime),
+        "resolvers": [asdict(item) for item in rows],
+    }
+
+
+def _update_runtime_state(
+    previous: dict[str, ResolverRuntimeState],
+    rows: list[ScanRow],
+    active_set: set[str],
+    standby_set: set[str],
+    now_ts: float,
+) -> tuple[dict[str, ResolverRuntimeState], dict[str, int]]:
+    runtime: dict[str, ResolverRuntimeState] = dict(previous)
+    counters = {
+        "promotion_count": 0,
+        "demotion_count": 0,
+        "reentry_count": 0,
+    }
+
+    for row in rows:
+        prev = runtime.get(row.resolver)
+        if prev is None:
+            current = ResolverRuntimeState(resolver=row.resolver)
+            prev_state = "candidate"
+        else:
+            current = ResolverRuntimeState(**asdict(prev))
+            prev_state = _normalize_runtime_state(prev.state)
+
+        if row.ok:
+            current.success_streak += 1
+            current.fail_streak = 0
+            current.last_seen_ok_ts = now_ts
+            current.next_probe_at_ts = now_ts
+            current.sr_short = _ema(current.sr_short, row.pass_rate, 0.35)
+            current.sr_long = _ema(current.sr_long, row.pass_rate, 0.08)
+            if row.resolver in active_set:
+                new_state = "active"
+            elif row.resolver in standby_set:
+                new_state = "standby"
+            elif prev_state in {"quarantine", "degraded"}:
+                new_state = "probation"
+            else:
+                new_state = "candidate"
+        else:
+            current.success_streak = 0
+            current.fail_streak = max(0, current.fail_streak) + 1
+            current.last_seen_fail_ts = now_ts
+            current.next_probe_at_ts = now_ts
+            current.sr_short = _ema(current.sr_short, 0.0, 0.35)
+            current.sr_long = _ema(current.sr_long, 0.0, 0.08)
+            new_state = "quarantine" if current.fail_streak >= 3 else "degraded"
+
+        if prev_state != new_state:
+            if prev_state in {"active", "standby"} and new_state not in {"active", "standby"}:
+                counters["demotion_count"] += 1
+            if prev_state not in {"active", "standby"} and new_state in {"active", "standby"}:
+                counters["promotion_count"] += 1
+            if prev_state == "quarantine" and new_state in {"probation", "candidate", "standby", "active"}:
+                counters["reentry_count"] += 1
+
+        current.state = new_state
+        runtime[row.resolver] = current
+
+    return runtime, counters
+
+
 def _is_public_ipv4(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip.strip())
@@ -582,6 +743,7 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     prev_rows, prev_resolver_list, prev_ts = _load_previous_report(args.output)
+    runtime_state = _load_runtime_state(args.runtime_state_json)
 
     cursor = int(getattr(args, "_sample_cursor", 0))
     sampled, new_cursor = _select_probe_candidates(
@@ -679,6 +841,18 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         previous_resolver_list=prev_resolver_list,
         source_candidates=source_candidates,
     )
+    runtime_state, runtime_counters = _update_runtime_state(
+        previous=runtime_state,
+        rows=rows,
+        active_set=active_set,
+        standby_set=standby_set,
+        now_ts=now_ts,
+    )
+    _atomic_write_json(
+        args.runtime_state_json,
+        _runtime_state_payload(runtime_state, now_ts),
+    )
+    runtime_counts = _runtime_state_counts(runtime_state)
 
     report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
@@ -714,6 +888,12 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "deep_protocol_check": bool(args.deep_protocol_check),
             "protocol_roundtrips": int(args.protocol_roundtrips),
             "max_per_prefix24": int(args.max_per_prefix24),
+            "runtime_state_file": args.runtime_state_json,
+            "runtime_state_total": len(runtime_state),
+            "runtime_state_counts": runtime_counts,
+            "promotion_count": int(runtime_counters["promotion_count"]),
+            "demotion_count": int(runtime_counters["demotion_count"]),
+            "reentry_count": int(runtime_counters["reentry_count"]),
         },
         "pools": {
             "active": active,
@@ -757,6 +937,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolvers-file", default="data/resolvers.txt")
     parser.add_argument("--output", default="state/resolvers_scan.json")
     parser.add_argument("--sample-cursor-file", default="state/resolvers_scan_cursor.txt")
+    parser.add_argument("--runtime-state-json", default="state/resolver_runtime_state.json")
     parser.add_argument("--zone", default="t1.phonexpress.ir")
     parser.add_argument("--qtype", default="TXT")
     parser.add_argument("--timeout", type=float, default=1.5)

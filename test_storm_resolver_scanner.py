@@ -3,16 +3,21 @@ from __future__ import annotations
 import json
 
 from storm_resolver_scanner import (
+    ResolverRuntimeState,
     ScanRow,
+    _atomic_write_json,
     _build_resolver_list,
     _build_prefilter_candidates,
     _classify_pools,
     _dedupe_resolvers,
+    _load_runtime_state,
     _load_previous_report,
     _resolve_phase1_limits,
+    _runtime_state_payload,
     _select_quick_survivors,
     _select_probe_candidates,
     _select_sticky_candidates,
+    _update_runtime_state,
 )
 
 
@@ -219,3 +224,90 @@ def test_select_quick_survivors_falls_back_when_everything_fails():
     ]
     out = _select_quick_survivors(rows, keep=1)
     assert out == ["1.1.1.1"]
+
+
+def test_runtime_state_roundtrip_load_and_parse(tmp_path):
+    path = tmp_path / "resolver_runtime_state.json"
+    now_ts = 1234.0
+    runtime = {
+        "1.1.1.1": ResolverRuntimeState(
+            resolver="1.1.1.1",
+            fail_streak=2,
+            success_streak=0,
+            last_seen_ok_ts=1000.0,
+            last_seen_fail_ts=1100.0,
+            next_probe_at_ts=1200.0,
+            sr_short=0.25,
+            sr_long=0.40,
+            state="quarantine",
+        )
+    }
+    _atomic_write_json(str(path), _runtime_state_payload(runtime, now_ts))
+    loaded = _load_runtime_state(str(path))
+    assert "1.1.1.1" in loaded
+    item = loaded["1.1.1.1"]
+    assert item.fail_streak == 2
+    assert item.state == "quarantine"
+    assert item.sr_short == 0.25
+
+
+def test_update_runtime_state_promote_and_demote_counts():
+    prev = {
+        "1.1.1.1": ResolverRuntimeState(
+            resolver="1.1.1.1",
+            fail_streak=2,
+            success_streak=0,
+            sr_short=0.0,
+            sr_long=0.0,
+            state="quarantine",
+        ),
+        "8.8.8.8": ResolverRuntimeState(
+            resolver="8.8.8.8",
+            fail_streak=0,
+            success_streak=4,
+            sr_short=1.0,
+            sr_long=1.0,
+            state="active",
+        ),
+    }
+    rows = [
+        ScanRow("1.1.1.1", True, 2, 2, 1.0, 100.0, 900.0, ""),
+        ScanRow("8.8.8.8", False, 0, 2, 0.0, 1500.0, -500.0, "no-response"),
+    ]
+    updated, counters = _update_runtime_state(
+        previous=prev,
+        rows=rows,
+        active_set={"1.1.1.1"},
+        standby_set=set(),
+        now_ts=2000.0,
+    )
+    assert updated["1.1.1.1"].state == "active"
+    assert updated["1.1.1.1"].fail_streak == 0
+    assert updated["8.8.8.8"].state == "degraded"
+    assert updated["8.8.8.8"].fail_streak == 1
+    assert counters["promotion_count"] == 1
+    assert counters["demotion_count"] == 1
+
+
+def test_update_runtime_state_reentry_to_probation_when_not_in_pool():
+    prev = {
+        "9.9.9.9": ResolverRuntimeState(
+            resolver="9.9.9.9",
+            fail_streak=4,
+            success_streak=0,
+            sr_short=0.0,
+            sr_long=0.1,
+            state="quarantine",
+        )
+    }
+    rows = [ScanRow("9.9.9.9", True, 1, 2, 0.5, 400.0, 100.0, "")]
+    updated, counters = _update_runtime_state(
+        previous=prev,
+        rows=rows,
+        active_set=set(),
+        standby_set=set(),
+        now_ts=3000.0,
+    )
+    assert updated["9.9.9.9"].state == "probation"
+    assert updated["9.9.9.9"].success_streak == 1
+    assert counters["reentry_count"] == 1
