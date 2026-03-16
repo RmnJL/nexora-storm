@@ -58,6 +58,12 @@ find_project_root() {
 copy_tree() {
   local src="$1"
   local dst="$2"
+  local src_real dst_real
+  src_real="$(cd "$src" && pwd)"
+  dst_real="$(cd "$(dirname "$dst")" && pwd)/$(basename "$dst")"
+  if [[ "$src_real" == "$dst_real" ]]; then
+    return 0
+  fi
   rm -rf "$dst"
   mkdir -p "$dst"
   if command -v rsync >/dev/null 2>&1; then
@@ -332,4 +338,3 @@ main() {
 }
 
 main "$@"
-
