@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import types
+
+import pytest
 
 from storm_resolver_scanner import (
     ResolverRuntimeState,
     ScanRow,
     _atomic_write_json,
+    _build_incremental_report,
     _build_resolver_list,
     _build_prefilter_candidates,
     _classify_pools,
@@ -18,9 +22,11 @@ from storm_resolver_scanner import (
     _promote_due_runtime_entries,
     _resolve_phase1_limits,
     _runtime_state_payload,
+    _select_publish_rows,
     _select_quick_survivors,
     _select_probe_candidates,
     _select_sticky_candidates,
+    _probe_resolver,
     _update_runtime_state,
 )
 
@@ -42,7 +48,8 @@ def test_classify_pools_splits_active_and_standby():
         failed_rows=failed,
         active_pool_size=1,
         standby_pool_size=2,
-        max_per_prefix24=2,
+        max_active_per_prefix24=2,
+        max_standby_per_prefix24=2,
     )
     assert active == ["1.1.1.1"]
     assert standby == ["8.8.8.8", "9.9.9.9"]
@@ -60,10 +67,31 @@ def test_classify_pools_applies_prefix24_diversity():
         failed_rows=[],
         active_pool_size=2,
         standby_pool_size=0,
-        max_per_prefix24=1,
+        max_active_per_prefix24=1,
+        max_standby_per_prefix24=2,
     )
     assert active == ["1.1.1.1", "2.2.2.2"]
     assert standby == []
+
+
+def test_classify_pools_uses_different_prefix_caps_for_active_and_standby():
+    publish = [
+        ScanRow("1.1.1.1", True, 2, 2, 1.0, 20.0, 980.0, ""),
+        ScanRow("1.1.1.2", True, 2, 2, 1.0, 21.0, 979.0, ""),
+        ScanRow("1.1.1.3", True, 2, 2, 1.0, 22.0, 978.0, ""),
+        ScanRow("2.2.2.2", True, 2, 2, 1.0, 23.0, 977.0, ""),
+        ScanRow("2.2.2.3", True, 2, 2, 1.0, 24.0, 976.0, ""),
+    ]
+    active, standby, _ = _classify_pools(
+        publish_rows=publish,
+        failed_rows=[],
+        active_pool_size=2,
+        standby_pool_size=4,
+        max_active_per_prefix24=1,
+        max_standby_per_prefix24=2,
+    )
+    assert active == ["1.1.1.1", "2.2.2.2"]
+    assert standby == ["1.1.1.2", "1.1.1.3", "2.2.2.3"]
 
 
 def test_build_resolver_list_preserves_priority_order():
@@ -373,3 +401,76 @@ def test_prioritize_due_candidates_keeps_due_first():
     }
     ordered = _prioritize_due_candidates(["1.1.1.1", "8.8.8.8", "9.9.9.9"], runtime, now_ts=100.0)
     assert ordered == ["8.8.8.8", "9.9.9.9", "1.1.1.1"]
+
+
+def test_build_incremental_report_marks_scan_in_progress():
+    args = types.SimpleNamespace(
+        zone="t1.mehrmarja.ir",
+        publish_min_pass_rate=0.55,
+        publish_max_latency_ms=900.0,
+        publish_min_score=0.0,
+        rounds=2,
+        min_success=1,
+        sample_mode="sequential",
+        sticky_rows=64,
+        quick_timeout=1.0,
+        quick_concurrency=100,
+        deep_protocol_check=1,
+        protocol_roundtrips=2,
+        max_active_per_prefix24=1,
+        max_standby_per_prefix24=2,
+        incremental_publish_sec=8.0,
+    )
+    rows = [ScanRow("1.1.1.1", True, 1, 1, 1.0, 123.0, 877.0, "", "active")]
+    publish_rows, failed_rows = _select_publish_rows(rows, 0.5, 1000.0, 0.0)
+    report = _build_incremental_report(
+        args=args,
+        now_ts=1000.0,
+        rows=rows,
+        publish_rows=publish_rows,
+        failed_rows=failed_rows,
+        active=["1.1.1.1"],
+        standby=[],
+        quarantine=[],
+        resolver_list=["1.1.1.1"],
+        marked_publish_rows=rows,
+        marked_quarantine_rows=[],
+        new_cursor=12,
+        prefilter_cap=1000,
+        prefilter_count=120,
+        prefilter_due=80,
+        quick_rows=rows,
+        quick_probe_cap=300,
+        quick_keep_cap=120,
+        quick_selected_count=30,
+        deep_probe_cap=200,
+        deep_due=140,
+        deep_target_count=200,
+        runtime_state_file="state/resolver_runtime_state.json",
+        runtime_reentry_due=3,
+    )
+    assert report["scan_in_progress"] is True
+    assert report["deep_target_count"] == 200
+    assert report["metrics"]["runtime_reentry_due"] == 3
+
+
+@pytest.mark.asyncio
+async def test_probe_resolver_fast_fails_when_min_success_unreachable(monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_probe_once(**kwargs):
+        calls["n"] += 1
+        return False, 1000.0, "no-response"
+
+    monkeypatch.setattr("storm_resolver_scanner._probe_once", fake_probe_once)
+    row = await _probe_resolver(
+        transport=None,
+        resolver="1.1.1.1",
+        timeout=1.0,
+        rounds=5,
+        min_success=2,
+        protocol_roundtrips=1,
+        data_probe=False,
+    )
+    assert row.ok is False
+    assert calls["n"] == 4

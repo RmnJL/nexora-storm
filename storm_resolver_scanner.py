@@ -327,6 +327,33 @@ def _limit_prefix24(items: list[str], max_per_prefix24: int) -> list[str]:
     return out
 
 
+def _select_diverse_resolvers(
+    ranked_rows: list[ScanRow],
+    take: int,
+    max_per_prefix24: int,
+) -> list[str]:
+    target = max(0, int(take))
+    if target <= 0:
+        return []
+    cap = int(max_per_prefix24)
+    if cap <= 0:
+        return [row.resolver for row in ranked_rows[:target]]
+    out: list[str] = []
+    counts: dict[str, int] = {}
+    for row in ranked_rows:
+        prefix = _prefix24_key(row.resolver)
+        if not prefix:
+            continue
+        cur = counts.get(prefix, 0)
+        if cur >= cap:
+            continue
+        counts[prefix] = cur + 1
+        out.append(row.resolver)
+        if len(out) >= target:
+            break
+    return out
+
+
 def _row_rank_key(row: ScanRow) -> tuple[float, float, str]:
     return (-row.pass_rate, row.latency_ms, row.resolver)
 
@@ -540,15 +567,25 @@ def _classify_pools(
     failed_rows: list[ScanRow],
     active_pool_size: int,
     standby_pool_size: int,
-    max_per_prefix24: int,
+    max_active_per_prefix24: int,
+    max_standby_per_prefix24: int,
 ) -> tuple[list[str], list[str], list[str]]:
     ranked = sorted(publish_rows, key=_row_rank_key)
     active_n = max(1, int(active_pool_size))
     standby_n = max(0, int(standby_pool_size))
 
-    diverse = _limit_prefix24([r.resolver for r in ranked], max_per_prefix24=max_per_prefix24)
-    active = diverse[:active_n]
-    standby = diverse[active_n : active_n + standby_n]
+    active = _select_diverse_resolvers(
+        ranked_rows=ranked,
+        take=active_n,
+        max_per_prefix24=max_active_per_prefix24,
+    )
+    active_set = set(active)
+    standby_ranked = [row for row in ranked if row.resolver not in active_set]
+    standby = _select_diverse_resolvers(
+        ranked_rows=standby_ranked,
+        take=standby_n,
+        max_per_prefix24=max_standby_per_prefix24,
+    )
     quarantine = [r.resolver for r in failed_rows]
     return active, standby, quarantine
 
@@ -597,6 +634,101 @@ def _mark_row_pools(
             )
         )
     return out
+
+
+def _select_publish_rows(
+    rows: list[ScanRow],
+    publish_min_pass_rate: float,
+    publish_max_latency_ms: float,
+    publish_min_score: float,
+) -> tuple[list[ScanRow], list[ScanRow]]:
+    publish_rows = [
+        row
+        for row in rows
+        if row.ok
+        and row.pass_rate >= publish_min_pass_rate
+        and (publish_max_latency_ms <= 0 or row.latency_ms <= publish_max_latency_ms)
+        and row.score >= publish_min_score
+    ]
+    publish_set = {row.resolver for row in publish_rows}
+    failed_rows = [row for row in rows if row.resolver not in publish_set]
+    return publish_rows, failed_rows
+
+
+def _build_incremental_report(
+    args: argparse.Namespace,
+    now_ts: float,
+    rows: list[ScanRow],
+    publish_rows: list[ScanRow],
+    failed_rows: list[ScanRow],
+    active: list[str],
+    standby: list[str],
+    quarantine: list[str],
+    resolver_list: list[str],
+    marked_publish_rows: list[ScanRow],
+    marked_quarantine_rows: list[ScanRow],
+    *,
+    new_cursor: int,
+    prefilter_cap: int,
+    prefilter_count: int,
+    prefilter_due: int,
+    quick_rows: list[ScanRow],
+    quick_probe_cap: int,
+    quick_keep_cap: int,
+    quick_selected_count: int,
+    deep_probe_cap: int,
+    deep_due: int,
+    deep_target_count: int,
+    runtime_state_file: str,
+    runtime_reentry_due: int,
+) -> dict[str, Any]:
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
+        "timestamp_ts": now_ts,
+        "zone": args.zone,
+        "total_scanned": len(rows),
+        "deep_target_count": int(deep_target_count),
+        "total_working": len(publish_rows),
+        "scan_in_progress": True,
+        "rollback_used": False,
+        "metrics": {
+            "publish_min_pass_rate": args.publish_min_pass_rate,
+            "publish_max_latency_ms": args.publish_max_latency_ms,
+            "publish_min_score": args.publish_min_score,
+            "rounds": args.rounds,
+            "min_success": args.min_success,
+            "sample_mode": args.sample_mode,
+            "sample_cursor": new_cursor,
+            "sticky_rows": args.sticky_rows,
+            "prefilter_keep": prefilter_cap,
+            "prefilter_count": prefilter_count,
+            "prefilter_due": int(prefilter_due),
+            "quick_timeout": args.quick_timeout,
+            "quick_concurrency": args.quick_concurrency,
+            "quick_max_probe": quick_probe_cap,
+            "quick_scanned": len(quick_rows),
+            "quick_working": sum(1 for row in quick_rows if row.ok),
+            "quick_selected": int(quick_selected_count),
+            "quick_keep": quick_keep_cap,
+            "deep_probe_cap": int(deep_probe_cap),
+            "deep_due": int(deep_due),
+            "deep_protocol_check": bool(args.deep_protocol_check),
+            "protocol_roundtrips": int(args.protocol_roundtrips),
+            "max_active_per_prefix24": int(args.max_active_per_prefix24),
+            "max_standby_per_prefix24": int(args.max_standby_per_prefix24),
+            "incremental_publish_sec": float(args.incremental_publish_sec),
+            "runtime_state_file": runtime_state_file,
+            "runtime_reentry_due": int(runtime_reentry_due),
+        },
+        "pools": {
+            "active": active,
+            "standby": standby,
+            "quarantine": quarantine,
+        },
+        "resolvers": _rows_to_dicts(marked_publish_rows),
+        "quarantine_resolvers": _rows_to_dicts(marked_quarantine_rows),
+        "resolver_list": resolver_list,
+    }
 
 
 def _load_previous_report(path: str) -> tuple[list[ScanRow], list[str], float]:
@@ -772,6 +904,10 @@ async def _probe_resolver(
             latency_samples.append(latency_ms)
         elif err:
             error = err
+        remaining = probes - (idx + 1)
+        # Fast-fail: when min_success is no longer reachable, stop probing early.
+        if successes + remaining < need:
+            break
         if idx + 1 < probes:
             await asyncio.sleep(0.03)
 
@@ -894,18 +1030,97 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             )
 
     tasks = [asyncio.create_task(_run(ip)) for ip in candidates]
-    rows = await asyncio.gather(*tasks)
-    rows.sort(key=_row_rank_key)
+    pending: set[asyncio.Task[ScanRow]] = set(tasks)
+    rows: list[ScanRow] = []
+    incremental_publish_sec = max(0.0, float(args.incremental_publish_sec))
+    last_incremental_publish_ts = time.time()
 
-    publish_rows = [
-        row
-        for row in rows
-        if row.ok
-        and row.pass_rate >= args.publish_min_pass_rate
-        and (args.publish_max_latency_ms <= 0 or row.latency_ms <= args.publish_max_latency_ms)
-        and row.score >= args.publish_min_score
-    ]
-    failed_rows = [row for row in rows if row.resolver not in {r.resolver for r in publish_rows}]
+    while pending:
+        if incremental_publish_sec > 0:
+            done, still_pending = await asyncio.wait(
+                pending,
+                timeout=incremental_publish_sec,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        else:
+            done, still_pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        pending = set(still_pending)
+
+        for task in done:
+            rows.append(task.result())
+
+        now_loop_ts = time.time()
+        if (
+            incremental_publish_sec > 0
+            and pending
+            and rows
+            and (now_loop_ts - last_incremental_publish_ts) >= incremental_publish_sec
+        ):
+            partial_rows = sorted(rows, key=_row_rank_key)
+            partial_publish, partial_failed = _select_publish_rows(
+                partial_rows,
+                publish_min_pass_rate=args.publish_min_pass_rate,
+                publish_max_latency_ms=args.publish_max_latency_ms,
+                publish_min_score=args.publish_min_score,
+            )
+            p_active, p_standby, p_quarantine = _classify_pools(
+                publish_rows=partial_publish,
+                failed_rows=partial_failed,
+                active_pool_size=args.active_pool_size,
+                standby_pool_size=args.standby_pool_size,
+                max_active_per_prefix24=args.max_active_per_prefix24,
+                max_standby_per_prefix24=args.max_standby_per_prefix24,
+            )
+            p_active_set = set(p_active)
+            p_standby_set = set(p_standby)
+            p_marked_publish = _mark_row_pools(partial_publish, p_active_set, p_standby_set)
+            p_marked_quarantine = _mark_row_pools(partial_failed, set(), set())
+            p_resolver_list = _build_resolver_list(
+                active=p_active,
+                standby=p_standby,
+                publish_rows=partial_publish,
+                previous_resolver_list=prev_resolver_list,
+                source_candidates=source_candidates,
+            )
+            incremental_report = _build_incremental_report(
+                args=args,
+                now_ts=now_loop_ts,
+                rows=partial_rows,
+                publish_rows=partial_publish,
+                failed_rows=partial_failed,
+                active=p_active,
+                standby=p_standby,
+                quarantine=p_quarantine,
+                resolver_list=p_resolver_list,
+                marked_publish_rows=p_marked_publish,
+                marked_quarantine_rows=p_marked_quarantine,
+                new_cursor=new_cursor,
+                prefilter_cap=prefilter_cap,
+                prefilter_count=len(prefilter_candidates),
+                prefilter_due=prefilter_due,
+                quick_rows=quick_rows,
+                quick_probe_cap=quick_probe_cap,
+                quick_keep_cap=quick_keep_cap,
+                quick_selected_count=len(quick_selected),
+                deep_probe_cap=deep_probe_cap,
+                deep_due=merged_due,
+                deep_target_count=len(candidates),
+                runtime_state_file=args.runtime_state_json,
+                runtime_reentry_due=runtime_reentry_due,
+            )
+            _atomic_write_json(args.output, incremental_report)
+            last_incremental_publish_ts = now_loop_ts
+
+    rows.sort(key=_row_rank_key)
+    publish_rows, failed_rows = _select_publish_rows(
+        rows,
+        publish_min_pass_rate=args.publish_min_pass_rate,
+        publish_max_latency_ms=args.publish_max_latency_ms,
+        publish_min_score=args.publish_min_score,
+    )
 
     now_ts = time.time()
     min_publish = max(2, min(4, max(1, int(args.active_pool_size))))
@@ -920,7 +1135,8 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         failed_rows=failed_rows,
         active_pool_size=args.active_pool_size,
         standby_pool_size=args.standby_pool_size,
-        max_per_prefix24=args.max_per_prefix24,
+        max_active_per_prefix24=args.max_active_per_prefix24,
+        max_standby_per_prefix24=args.max_standby_per_prefix24,
     )
     active_set = set(active)
     standby_set = set(standby)
@@ -984,6 +1200,9 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "deep_protocol_check": bool(args.deep_protocol_check),
             "protocol_roundtrips": int(args.protocol_roundtrips),
             "max_per_prefix24": int(args.max_per_prefix24),
+            "max_active_per_prefix24": int(args.max_active_per_prefix24),
+            "max_standby_per_prefix24": int(args.max_standby_per_prefix24),
+            "incremental_publish_sec": float(args.incremental_publish_sec),
             "reentry_cooldown_seq_sec": list(
                 getattr(args, "_reentry_cooldowns", _DEFAULT_REENTRY_COOLDOWN_SECONDS)
             ),
@@ -1059,6 +1278,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-pool-size", type=int, default=12)
     parser.add_argument("--standby-pool-size", type=int, default=64)
     parser.add_argument("--max-per-prefix24", type=int, default=2, help="max active/standby entries from same /24; <=0 disables")
+    parser.add_argument("--max-active-per-prefix24", type=int, default=1, help="max active entries from same /24; <=0 disables")
+    parser.add_argument("--max-standby-per-prefix24", type=int, default=2, help="max standby entries from same /24; <=0 disables")
+    parser.add_argument("--incremental-publish-sec", type=float, default=8.0, help="publish partial scanner output during deep phase; <=0 disables")
     parser.add_argument("--reentry-cooldown-seq", default="30,60,120,300,600,1200", help="comma separated cooldown ladder in seconds")
     parser.add_argument("--publish-min-pass-rate", type=float, default=0.55)
     parser.add_argument("--publish-max-latency-ms", type=float, default=900.0)
