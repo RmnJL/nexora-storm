@@ -15,6 +15,7 @@ from storm_resolver_scanner import (
     _classify_pools,
     _cooldown_for_fail_streak,
     _dedupe_resolvers,
+    _observability_summary,
     _parse_cooldown_sequence,
     _load_runtime_state,
     _load_previous_report,
@@ -22,6 +23,7 @@ from storm_resolver_scanner import (
     _promote_due_runtime_entries,
     _resolve_phase1_limits,
     _runtime_state_payload,
+    _runtime_cooldown_histogram,
     _select_publish_rows,
     _select_quick_survivors,
     _select_probe_candidates,
@@ -403,6 +405,36 @@ def test_prioritize_due_candidates_keeps_due_first():
     assert ordered == ["8.8.8.8", "9.9.9.9", "1.1.1.1"]
 
 
+def test_runtime_cooldown_histogram_has_expected_buckets():
+    runtime = {
+        "1.1.1.1": ResolverRuntimeState(resolver="1.1.1.1", next_probe_at_ts=90.0),
+        "8.8.8.8": ResolverRuntimeState(resolver="8.8.8.8", next_probe_at_ts=110.0),
+        "9.9.9.9": ResolverRuntimeState(resolver="9.9.9.9", next_probe_at_ts=170.0),
+        "4.4.4.4": ResolverRuntimeState(resolver="4.4.4.4", next_probe_at_ts=1450.0),
+    }
+    hist = _runtime_cooldown_histogram(runtime, now_ts=100.0)
+    assert hist["ready"] == 1
+    assert hist["lt30"] == 1
+    assert hist["sec60_120"] == 1
+    assert hist["ge1200"] == 1
+
+
+def test_observability_summary_contains_counts_and_histogram():
+    runtime = {
+        "1.1.1.1": ResolverRuntimeState(resolver="1.1.1.1", state="active", next_probe_at_ts=0.0),
+        "8.8.8.8": ResolverRuntimeState(resolver="8.8.8.8", state="quarantine", next_probe_at_ts=500.0),
+    }
+    summary = _observability_summary(
+        runtime=runtime,
+        counters={"promotion_count": 2, "demotion_count": 1, "reentry_count": 3},
+        now_ts=100.0,
+    )
+    assert summary["state_counts"]["active"] == 1
+    assert summary["state_counts"]["quarantine"] == 1
+    assert "cooldown_histogram" in summary
+    assert summary["promotion_count"] == 2
+
+
 def test_build_incremental_report_marks_scan_in_progress():
     args = types.SimpleNamespace(
         zone="t1.mehrmarja.ir",
@@ -448,10 +480,18 @@ def test_build_incremental_report_marks_scan_in_progress():
         deep_target_count=200,
         runtime_state_file="state/resolver_runtime_state.json",
         runtime_reentry_due=3,
+        observability={
+            "state_counts": {"active": 1},
+            "cooldown_histogram": {"ready": 1},
+            "promotion_count": 0,
+            "demotion_count": 0,
+            "reentry_count": 0,
+        },
     )
     assert report["scan_in_progress"] is True
     assert report["deep_target_count"] == 200
     assert report["metrics"]["runtime_reentry_due"] == 3
+    assert report["observability"]["state_counts"]["active"] == 1
 
 
 @pytest.mark.asyncio

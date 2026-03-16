@@ -71,6 +71,57 @@ def _runtime_state_counts(runtime: dict[str, ResolverRuntimeState]) -> dict[str,
     return counts
 
 
+def _runtime_cooldown_histogram(
+    runtime: dict[str, ResolverRuntimeState],
+    now_ts: float,
+) -> dict[str, int]:
+    hist = {
+        "ready": 0,
+        "lt30": 0,
+        "sec30_60": 0,
+        "sec60_120": 0,
+        "sec120_300": 0,
+        "sec300_600": 0,
+        "sec600_1200": 0,
+        "ge1200": 0,
+    }
+    for item in runtime.values():
+        wait = float(item.next_probe_at_ts) - float(now_ts)
+        if wait <= 0:
+            hist["ready"] += 1
+        elif wait < 30:
+            hist["lt30"] += 1
+        elif wait < 60:
+            hist["sec30_60"] += 1
+        elif wait < 120:
+            hist["sec60_120"] += 1
+        elif wait < 300:
+            hist["sec120_300"] += 1
+        elif wait < 600:
+            hist["sec300_600"] += 1
+        elif wait < 1200:
+            hist["sec600_1200"] += 1
+        else:
+            hist["ge1200"] += 1
+    return hist
+
+
+def _observability_summary(
+    runtime: dict[str, ResolverRuntimeState],
+    counters: dict[str, int],
+    now_ts: float,
+) -> dict[str, Any]:
+    state_counts = _runtime_state_counts(runtime)
+    cooldown_histogram = _runtime_cooldown_histogram(runtime, now_ts)
+    return {
+        "state_counts": state_counts,
+        "cooldown_histogram": cooldown_histogram,
+        "promotion_count": int(counters.get("promotion_count", 0) or 0),
+        "demotion_count": int(counters.get("demotion_count", 0) or 0),
+        "reentry_count": int(counters.get("reentry_count", 0) or 0),
+    }
+
+
 def _parse_cooldown_sequence(raw: str) -> tuple[float, ...]:
     values: list[float] = []
     for token in str(raw or "").split(","):
@@ -681,6 +732,7 @@ def _build_incremental_report(
     deep_target_count: int,
     runtime_state_file: str,
     runtime_reentry_due: int,
+    observability: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
@@ -719,6 +771,19 @@ def _build_incremental_report(
             "incremental_publish_sec": float(args.incremental_publish_sec),
             "runtime_state_file": runtime_state_file,
             "runtime_reentry_due": int(runtime_reentry_due),
+            "runtime_state_counts": dict(observability.get("state_counts", {}) or {}),
+            "state_counts": dict(observability.get("state_counts", {}) or {}),
+            "cooldown_histogram": dict(observability.get("cooldown_histogram", {}) or {}),
+            "promotion_count": int(observability.get("promotion_count", 0) or 0),
+            "demotion_count": int(observability.get("demotion_count", 0) or 0),
+            "reentry_count": int(observability.get("reentry_count", 0) or 0),
+        },
+        "observability": {
+            "state_counts": dict(observability.get("state_counts", {}) or {}),
+            "cooldown_histogram": dict(observability.get("cooldown_histogram", {}) or {}),
+            "promotion_count": int(observability.get("promotion_count", 0) or 0),
+            "demotion_count": int(observability.get("demotion_count", 0) or 0),
+            "reentry_count": int(observability.get("reentry_count", 0) or 0),
         },
         "pools": {
             "active": active,
@@ -1110,6 +1175,15 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
                 deep_target_count=len(candidates),
                 runtime_state_file=args.runtime_state_json,
                 runtime_reentry_due=runtime_reentry_due,
+                observability=_observability_summary(
+                    runtime=runtime_state,
+                    counters={
+                        "promotion_count": 0,
+                        "demotion_count": 0,
+                        "reentry_count": 0,
+                    },
+                    now_ts=now_loop_ts,
+                ),
             )
             _atomic_write_json(args.output, incremental_report)
             last_incremental_publish_ts = now_loop_ts
@@ -1162,7 +1236,12 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
         args.runtime_state_json,
         _runtime_state_payload(runtime_state, now_ts),
     )
-    runtime_counts = _runtime_state_counts(runtime_state)
+    observability = _observability_summary(
+        runtime=runtime_state,
+        counters=runtime_counters,
+        now_ts=now_ts,
+    )
+    runtime_counts = dict(observability["state_counts"])
 
     report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts)),
@@ -1210,9 +1289,18 @@ async def run_scan_once(args: argparse.Namespace) -> dict[str, Any]:
             "runtime_state_file": args.runtime_state_json,
             "runtime_state_total": len(runtime_state),
             "runtime_state_counts": runtime_counts,
-            "promotion_count": int(runtime_counters["promotion_count"]),
-            "demotion_count": int(runtime_counters["demotion_count"]),
-            "reentry_count": int(runtime_counters["reentry_count"]),
+            "state_counts": dict(observability["state_counts"]),
+            "cooldown_histogram": dict(observability["cooldown_histogram"]),
+            "promotion_count": int(observability["promotion_count"]),
+            "demotion_count": int(observability["demotion_count"]),
+            "reentry_count": int(observability["reentry_count"]),
+        },
+        "observability": {
+            "state_counts": dict(observability["state_counts"]),
+            "cooldown_histogram": dict(observability["cooldown_histogram"]),
+            "promotion_count": int(observability["promotion_count"]),
+            "demotion_count": int(observability["demotion_count"]),
+            "reentry_count": int(observability["reentry_count"]),
         },
         "pools": {
             "active": active,
