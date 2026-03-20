@@ -83,8 +83,6 @@ install_venv_requirements() {
   python3 -m venv "$base/.venv"
   "$base/.venv/bin/pip" install --upgrade pip
   if ! "$base/.venv/bin/pip" install \
-    --trusted-host mirror-pypi.runflare.com \
-    -i https://mirror-pypi.runflare.com/simple \
     -r "$req" \
     --timeout 120 \
     --retries 20; then
